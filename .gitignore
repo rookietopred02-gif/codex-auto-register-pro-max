@@ -5,6 +5,9 @@ __pycache__/
 venv/
 env/
 .env
+.camoufox-cache/
+.camoufox-sessions/
+.temp_mail_session.json
 
 # Go 编译产物
 *.exe
@@ -17,6 +20,9 @@ logs/
 *.log
 codes.json
 accounts.txt
+_tmp_*
+temp_mail_state.db
 
 # 真实配置文件（含个人密码，绝对不能上传！）
 config.json
+api-register-go.__bak__/

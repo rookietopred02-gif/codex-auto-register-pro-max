@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
+	"log"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -18,13 +18,9 @@ import (
 )
 
 const (
-	tempMailHomeURL      = "https://temp-mail.org/en/"
-	tempMailAPIBase      = "https://web2.temp-mail.org"
-	mailTMAPIBase        = "https://api.mail.tm"
+	tempmailLOLAPIBase   = "https://api.tempmail.lol/v2"
 	tempMailPollInterval = 2 * time.Second
 	tempMailDefaultGap   = 15 * time.Second
-	tempMailCreateWait   = 24 * time.Second
-	mailTMDomainCacheTTL = 15 * time.Minute
 )
 
 var (
@@ -39,6 +35,7 @@ type TempMailConfig struct {
 	Password         string `json:"password"`
 	AllowParallel    bool   `json:"allow_parallel,omitempty"`
 	NextDelaySeconds *int   `json:"next_delay_seconds,omitempty"`
+	APIBaseURL       string `json:"api_base_url,omitempty"`
 }
 
 func (c *TempMailConfig) PostSuccessDelaySeconds() int {
@@ -59,40 +56,42 @@ func (c *TempMailConfig) MailboxCreateGap() time.Duration {
 	return time.Duration(c.PostSuccessDelaySeconds()) * time.Second
 }
 
+func (c *TempMailConfig) TempmailLOLAPIBase() string {
+	if c == nil {
+		return tempmailLOLAPIBase
+	}
+	base := strings.TrimSpace(c.APIBaseURL)
+	if base == "" {
+		return tempmailLOLAPIBase
+	}
+	return strings.TrimRight(base, "/")
+}
+
 type tempMailRow struct {
 	ID       string
 	Received string
 	Text     string
 }
 
-type tempMailboxResp struct {
+type tempmailLOLMailboxResp struct {
+	Address string `json:"address"`
 	Token   string `json:"token"`
-	Mailbox string `json:"mailbox"`
-}
-
-type tempMessagesResp struct {
-	Mailbox  string                   `json:"mailbox"`
-	Messages []map[string]interface{} `json:"messages"`
-}
-
-type mailTMHydraResp struct {
-	Members []map[string]interface{} `json:"hydra:member"`
 }
 
 type TempMailService struct {
-	mu              sync.Mutex
-	httpClient      *HTTPClient
-	proxy           string
-	createGap       time.Duration
-	provider        string
-	token           string
-	currentMailbox  string
-	firstServed     bool
-	freshOnFirst    bool
-	lastCreatedAt   time.Time
-	mailTMDomain    string
-	domainFetchedAt time.Time
-	detailCache     map[string]string
+	mu             sync.Mutex
+	httpClient     *HTTPClient
+	proxy          string
+	createGap      time.Duration
+	provider       string
+	token          string
+	currentMailbox string
+	firstServed    bool
+	freshOnFirst   bool
+	lastCreatedAt  time.Time
+	detailCache    map[string]string
+	blockedDomains map[string]string
+	apiBaseURL     string
 }
 
 var tempMailService = &TempMailService{createGap: tempMailDefaultGap}
@@ -112,8 +111,21 @@ func acquireTempMailbox() (string, error) {
 	return tempMailService.AcquireMailbox()
 }
 
+func rejectTempMailMailbox(mailbox, reason string) string {
+	return tempMailService.MarkRejectedMailbox(mailbox, reason)
+}
+
 func configureTempMailRuntime(proxy string, cfg *TempMailConfig) {
 	tempMailService.Configure(proxy, cfg)
+}
+
+func mailboxDomain(mailbox string) string {
+	mailbox = strings.ToLower(strings.TrimSpace(mailbox))
+	at := strings.LastIndex(mailbox, "@")
+	if at < 0 || at+1 >= len(mailbox) {
+		return ""
+	}
+	return mailbox[at+1:]
 }
 
 func (s *TempMailService) Configure(proxy string, cfg *TempMailConfig) {
@@ -129,10 +141,19 @@ func (s *TempMailService) Configure(proxy string, cfg *TempMailConfig) {
 		s.proxy = proxy
 		// 代理变更后重建 HTTP 客户端（保留已缓存 token/mailbox）。
 		s.httpClient = nil
-		s.detailCache = nil
 	}
+	s.apiBaseURL = tempmailLOLAPIBase
+	if cfg != nil {
+		s.apiBaseURL = cfg.TempmailLOLAPIBase()
+	}
+	// 新任务固定使用 tempmail.lol，避免沿用上一轮任务残留状态。
+	s.provider = ""
+	s.token = ""
+	s.currentMailbox = ""
+	s.detailCache = nil
 	s.firstServed = false
 	s.freshOnFirst = false
+	s.blockedDomains = loadBlockedTempMailDomains()
 }
 
 func (s *TempMailService) EnsureReady() error {
@@ -150,28 +171,67 @@ func (s *TempMailService) ensureReadyLocked() error {
 		s.httpClient = client
 	}
 
-	hasReadyMailbox := isValidMailbox(s.currentMailbox) && (s.token != "" || strings.EqualFold(s.provider, "mailtm"))
+	hasReadyMailbox := isValidMailbox(s.currentMailbox) && s.token != ""
 	if hasReadyMailbox {
 		if s.provider == "" {
-			s.provider = "temp-mail"
+			s.provider = "tempmail-lol"
 		}
 		s.freshOnFirst = true
 		return nil
 	}
 
-	if s.loadSessionLocked() && s.validateCurrentMailboxLocked() {
-		s.firstServed = false
-		s.freshOnFirst = true
-		return nil
+	if s.loadSessionLocked() {
+		if s.validateCurrentMailboxLocked() {
+			s.firstServed = false
+			s.freshOnFirst = true
+			return nil
+		}
+		s.provider = ""
+		s.token = ""
+		s.currentMailbox = ""
+		s.detailCache = nil
 	}
-
-	_, _, _ = s.httpClient.Get(tempMailHomeURL)
 	if err := s.createOrRotateMailboxLocked(""); err != nil {
 		return err
 	}
 	s.firstServed = false
 	s.freshOnFirst = false
 	return nil
+}
+
+func (s *TempMailService) MarkRejectedMailbox(mailbox, reason string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	domain := mailboxDomain(mailbox)
+	if domain == "" {
+		return ""
+	}
+	if s.blockedDomains == nil {
+		s.blockedDomains = make(map[string]string)
+	}
+	s.blockedDomains[domain] = strings.TrimSpace(reason)
+	if err := persistBlockedTempMailDomain(domain, reason); err != nil {
+		log.Printf("[warning] %s", localizeRuntimeText(activeLanguage(), fmt.Sprintf("持久化临时邮箱域名失败: %v", err)))
+	}
+
+	if strings.EqualFold(mailboxDomain(s.currentMailbox), domain) {
+		s.currentMailbox = ""
+		s.detailCache = nil
+		if strings.EqualFold(s.provider, "tempmail-lol") {
+			s.token = ""
+		}
+	}
+	return domain
+}
+
+func (s *TempMailService) isBlockedDomainLocked(domain string) bool {
+	domain = strings.TrimSpace(strings.ToLower(domain))
+	if domain == "" || len(s.blockedDomains) == 0 {
+		return false
+	}
+	_, blocked := s.blockedDomains[domain]
+	return blocked
 }
 
 func (s *TempMailService) AcquireMailbox() (string, error) {
@@ -184,7 +244,7 @@ func (s *TempMailService) AcquireMailbox() (string, error) {
 
 	if !s.firstServed {
 		s.firstServed = true
-		if s.freshOnFirst || strings.EqualFold(s.provider, "mailtm") {
+		if s.freshOnFirst {
 			// 新任务的首个账号也强制拿新邮箱，避免重启后复用上一个 mailbox。
 			if err := s.createFreshMailboxLocked(s.token); err == nil {
 				s.freshOnFirst = false
@@ -205,401 +265,80 @@ func (s *TempMailService) AcquireMailbox() (string, error) {
 
 func (s *TempMailService) createFreshMailboxLocked(authToken string) error {
 	previousMailbox := strings.TrimSpace(strings.ToLower(s.currentMailbox))
-	if err := s.createOrRotateMailboxLocked(authToken); err != nil {
-		return err
-	}
-	if previousMailbox != "" && strings.EqualFold(previousMailbox, strings.TrimSpace(strings.ToLower(s.currentMailbox))) {
-		if strings.EqualFold(s.provider, "temp-mail") {
-			broadcast("    ⚠️ Temp Mail 未拿到新邮箱，自动切换到 mail.tm 以避免复用旧地址", "warning")
-			if err := s.createMailTMMailboxLocked(); err == nil {
-				return nil
-			}
+	const maxAttempts = 8
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := s.createOrRotateMailboxLocked(authToken); err != nil {
+			return err
 		}
-		return fmt.Errorf("未获取到新的临时邮箱，已阻止复用旧地址: %s", previousMailbox)
+		authToken = s.token
+
+		currentMailbox := strings.TrimSpace(strings.ToLower(s.currentMailbox))
+		if previousMailbox != "" && strings.EqualFold(previousMailbox, currentMailbox) {
+			lastErr = fmt.Errorf("未获取到新的临时邮箱，已阻止复用旧地址: %s", previousMailbox)
+		}
+
+		domain := mailboxDomain(currentMailbox)
+		if currentMailbox != "" && !s.isBlockedDomainLocked(domain) && !strings.EqualFold(previousMailbox, currentMailbox) {
+			return nil
+		}
+
+		if currentMailbox != "" && s.isBlockedDomainLocked(domain) {
+			reason := truncate(s.blockedDomains[domain], 80)
+			if reason == "" {
+				reason = "该域名已在本地数据库中标记为不可用"
+			}
+			broadcast(fmt.Sprintf("    ⚠️ 跳过数据库中已标记不可用的临时邮箱域名: %s (%s)", domain, reason), "warning")
+			s.currentMailbox = ""
+			s.detailCache = nil
+			s.token = ""
+			lastErr = fmt.Errorf("临时邮箱域名已在本地数据库中标记为不可用: %s", domain)
+		}
 	}
-	return nil
+
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("本地数据库中没有可用的临时邮箱域名")
 }
 
 func (s *TempMailService) createOrRotateMailboxLocked(authToken string) error {
-	if strings.EqualFold(s.provider, "mailtm") {
-		return s.createMailTMMailboxLocked()
-	}
-
+	_ = authToken
 	if wait := s.createGap - time.Since(s.lastCreatedAt); wait > 0 {
-		broadcast(fmt.Sprintf("    ⏳ Temp Mail 冷却中，等待 %ds...", int(wait.Seconds())+1), "dim")
+		broadcast(fmt.Sprintf("    ⏳ tempmail.lol 冷却中，等待 %ds...", int(wait.Seconds())+1), "dim")
 		time.Sleep(wait)
 	}
-
-	extraHeaders := map[string]string{
-		"Accept":       "application/json",
-		"Content-Type": "application/json",
-	}
-	if strings.TrimSpace(authToken) != "" {
-		extraHeaders["Authorization"] = "Bearer " + strings.TrimSpace(authToken)
-	}
-
-	var lastErr error
-	deadline := time.Now().Add(tempMailCreateWait)
-	for attempt := 1; ; attempt++ {
-		status, body, err := s.httpClient.PostJSON(tempMailAPIBase+"/mailbox", map[string]interface{}{}, extraHeaders)
-		if err != nil {
-			lastErr = fmt.Errorf("请求 temp-mail mailbox 失败: %w", err)
-		} else if status == 429 {
-			lastErr = fmt.Errorf("请求 temp-mail mailbox 触发限流: %d %s", status, truncate(body, 120))
-			sleep := time.Duration(attempt*4) * time.Second
-			if sleep > 45*time.Second {
-				sleep = 45 * time.Second
-			}
-			broadcast(fmt.Sprintf("    ⚠️ Temp Mail 限流，%ds 后重试...", int(sleep.Seconds())), "warning")
-			if time.Now().Add(sleep).After(deadline) {
-				break
-			}
-			time.Sleep(sleep)
-			continue
-		} else if status < 200 || status >= 300 {
-			lastErr = fmt.Errorf("请求 temp-mail mailbox 失败: %d %s", status, truncate(body, 200))
-		} else {
-			var resp tempMailboxResp
-			if err := json.Unmarshal([]byte(body), &resp); err != nil {
-				lastErr = fmt.Errorf("解析 temp-mail mailbox 失败: %w", err)
-			} else {
-				resp.Token = strings.TrimSpace(resp.Token)
-				resp.Mailbox = strings.TrimSpace(resp.Mailbox)
-				if resp.Token == "" || !isValidMailbox(resp.Mailbox) {
-					lastErr = fmt.Errorf("temp-mail 未返回可用邮箱")
-				} else {
-					s.token = resp.Token
-					s.provider = "temp-mail"
-					s.currentMailbox = resp.Mailbox
-					s.lastCreatedAt = time.Now()
-					s.saveSessionLocked()
-					return nil
-				}
-			}
+	if err := s.createTempmailLOLMailboxLocked(); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "限流") || strings.Contains(err.Error(), "429") {
+			return fmt.Errorf("%w（建议先将 Temp Mail 数量设为 1，或为任务设置代理/VPN 后重试）", err)
 		}
-
-		sleep := time.Duration(attempt) * time.Second
-		if sleep > 15*time.Second {
-			sleep = 15 * time.Second
-		}
-		if time.Now().Add(sleep).After(deadline) {
-			break
-		}
-		time.Sleep(sleep)
-	}
-
-	if s.validateCurrentMailboxLocked() {
-		broadcast("    ⚠️ Temp Mail 创建新邮箱持续限流，复用当前邮箱继续", "warning")
-		return nil
-	}
-
-	// temp-mail.org 被限流时自动切换到 mail.tm，避免任务硬失败
-	errText := ""
-	if lastErr != nil {
-		errText = lastErr.Error()
-	}
-	if strings.Contains(strings.ToLower(errText), "限流") || strings.Contains(errText, "429") {
-		broadcast("    ⚠️ Temp Mail 持续限流，自动切换到备用临时邮箱服务 mail.tm", "warning")
-		if err := s.createMailTMMailboxLocked(); err == nil {
-			return nil
-		}
-	}
-
-	if lastErr == nil {
-		lastErr = fmt.Errorf("请求 temp-mail mailbox 失败")
-	}
-	if strings.Contains(strings.ToLower(lastErr.Error()), "限流") || strings.Contains(lastErr.Error(), "429") {
-		return fmt.Errorf("%w（建议先将 Temp Mail 数量设为 1，或为任务设置代理/VPN 后重试）", lastErr)
-	}
-	return lastErr
-}
-
-func (s *TempMailService) tempMailGetLocked(path string) (int, string, error) {
-	if s.httpClient == nil {
-		return 0, "", fmt.Errorf("temp-mail client is nil")
-	}
-	req, err := fhttp.NewRequest("GET", tempMailAPIBase+path, nil)
-	if err != nil {
-		return 0, "", err
-	}
-	s.httpClient.setGetHeaders(req)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.token)
-
-	resp, err := s.httpClient.client.Do(req)
-	if err != nil {
-		return 0, "", err
-	}
-	defer resp.Body.Close()
-	s.httpClient.saveCookies(resp)
-
-	b, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, string(b), nil
-}
-
-func (s *TempMailService) fetchRowsLocked() (string, []tempMailRow, error) {
-	if strings.EqualFold(s.provider, "mailtm") {
-		return s.fetchRowsMailTMLocked()
-	}
-
-	var (
-		status int
-		body   string
-		err    error
-	)
-
-	for attempt := 1; attempt <= 5; attempt++ {
-		status, body, err = s.tempMailGetLocked("/messages")
-		if err != nil {
-			if attempt < 5 {
-				time.Sleep(time.Duration(attempt) * time.Second)
-				continue
-			}
-			return "", nil, err
-		}
-		if status == 429 {
-			if attempt < 5 {
-				wait := time.Duration(attempt*3) * time.Second
-				broadcast(fmt.Sprintf("    ⚠️ Temp Mail 消息拉取限流，%ds 后重试...", int(wait.Seconds())), "warning")
-				time.Sleep(wait)
-				continue
-			}
-			break
-		}
-		if status == 401 || status == 403 {
-			if rotateErr := s.createOrRotateMailboxLocked(""); rotateErr != nil {
-				return "", nil, rotateErr
-			}
-			status, body, err = s.tempMailGetLocked("/messages")
-			if err != nil {
-				return "", nil, err
-			}
-		}
-		break
-	}
-	if status < 200 || status >= 300 {
-		return "", nil, fmt.Errorf("读取 temp-mail 消息失败: %d %s", status, truncate(body, 200))
-	}
-
-	var resp tempMessagesResp
-	if err := json.Unmarshal([]byte(body), &resp); err != nil {
-		return "", nil, fmt.Errorf("解析 temp-mail 消息失败: %w", err)
-	}
-
-	mailbox := strings.TrimSpace(resp.Mailbox)
-	if isValidMailbox(mailbox) {
-		s.currentMailbox = mailbox
-		s.saveSessionLocked()
-	}
-
-	rows := make([]tempMailRow, 0, len(resp.Messages))
-	for idx, msg := range resp.Messages {
-		row := tempMailRow{
-			ID:       strings.TrimSpace(pickFirstNonEmpty(strFromAny(msg["id"]), strFromAny(msg["_id"]), strFromAny(msg["message_id"]))),
-			Received: strings.TrimSpace(pickFirstNonEmpty(strFromAny(msg["created_at"]), strFromAny(msg["createdAt"]), strFromAny(msg["date"]), strFromAny(msg["timestamp"]), strFromAny(msg["time"]), strFromAny(msg["receivedAt"]), strFromAny(msg["sent_at"]))),
-		}
-		if row.ID == "" {
-			row.ID = fmt.Sprintf("row-%d", idx)
-		}
-		if b, err := json.Marshal(msg); err == nil {
-			row.Text = string(b)
-		}
-		rows = append(rows, row)
-	}
-
-	return mailbox, rows, nil
-}
-
-func (s *TempMailService) createMailTMMailboxLocked() error {
-	if s.httpClient == nil {
-		return fmt.Errorf("temp-mail client is nil")
-	}
-	domain, err := s.fetchMailTMDomainLocked()
-	if err != nil {
 		return err
 	}
-
-	// 避免地址冲突，最多尝试 6 次。
-	var (
-		address string
-		token   string
-		lastErr error
-	)
-	for i := 0; i < 6; i++ {
-		local := fmt.Sprintf("tm%d%x", time.Now().Unix()%1_000_000_000, rand.Intn(0xffff))
-		address = strings.ToLower(strings.TrimSpace(local + "@" + domain))
-		password := fmt.Sprintf("Qw%d!mT", 100000+rand.Intn(899999))
-
-		accPayload := map[string]string{
-			"address":  address,
-			"password": password,
-		}
-		status, body, reqErr := s.mailTMPostJSONLocked("/accounts", accPayload, "")
-		if reqErr != nil {
-			lastErr = fmt.Errorf("创建 mail.tm 账号失败: %w", reqErr)
-			continue
-		}
-		if status < 200 || status >= 300 {
-			// 地址冲突会返回 422，继续换地址重试。
-			if status == 422 {
-				lastErr = fmt.Errorf("mail.tm 地址冲突")
-				continue
-			}
-			lastErr = fmt.Errorf("创建 mail.tm 账号失败: %d %s", status, truncate(body, 180))
-			continue
-		}
-
-		tokPayload := map[string]string{
-			"address":  address,
-			"password": password,
-		}
-		ts, tb, tokErr := s.mailTMPostJSONLocked("/token", tokPayload, "")
-		if tokErr != nil {
-			lastErr = fmt.Errorf("获取 mail.tm token 失败: %w", tokErr)
-			continue
-		}
-		if ts < 200 || ts >= 300 {
-			lastErr = fmt.Errorf("获取 mail.tm token 失败: %d %s", ts, truncate(tb, 180))
-			continue
-		}
-
-		var tok map[string]interface{}
-		if err := json.Unmarshal([]byte(tb), &tok); err != nil {
-			lastErr = fmt.Errorf("解析 mail.tm token 失败: %w", err)
-			continue
-		}
-		token = strings.TrimSpace(strFromAny(tok["token"]))
-		if token == "" {
-			lastErr = fmt.Errorf("mail.tm token 为空")
-			continue
-		}
-		break
-	}
-	if token == "" {
-		if lastErr == nil {
-			lastErr = fmt.Errorf("mail.tm 创建邮箱失败")
-		}
-		return lastErr
-	}
-
-	s.provider = "mailtm"
-	s.token = token
-	s.currentMailbox = address
-	s.lastCreatedAt = time.Now()
-	s.detailCache = make(map[string]string)
-	s.saveSessionLocked()
 	return nil
 }
 
-func (s *TempMailService) fetchMailTMDomainLocked() (string, error) {
-	if domain := strings.TrimSpace(s.mailTMDomain); domain != "" && time.Since(s.domainFetchedAt) < mailTMDomainCacheTTL {
-		return domain, nil
-	}
-	status, body, err := s.mailTMGetLocked("/domains?page=1", "")
-	if err != nil {
-		return "", fmt.Errorf("读取 mail.tm 域名失败: %w", err)
-	}
-	if status < 200 || status >= 300 {
-		return "", fmt.Errorf("读取 mail.tm 域名失败: %d %s", status, truncate(body, 180))
-	}
-	var resp mailTMHydraResp
-	if err := json.Unmarshal([]byte(body), &resp); err != nil {
-		return "", fmt.Errorf("解析 mail.tm 域名失败: %w", err)
-	}
-	for _, d := range resp.Members {
-		domain := strings.TrimSpace(strFromAny(d["domain"]))
-		isActive := strings.EqualFold(strFromAny(d["isActive"]), "true") || strFromAny(d["isActive"]) == "1"
-		if !isActive {
-			// bool 类型兼容
-			if b, ok := d["isActive"].(bool); !ok || !b {
-				continue
-			}
-		}
-		if isValidMailbox("x@" + domain) {
-			s.mailTMDomain = domain
-			s.domainFetchedAt = time.Now()
-			return domain, nil
-		}
-	}
-	return "", fmt.Errorf("mail.tm 无可用域名")
-}
-
-func (s *TempMailService) fetchRowsMailTMLocked() (string, []tempMailRow, error) {
-	if strings.TrimSpace(s.token) == "" || !isValidMailbox(s.currentMailbox) {
-		return "", nil, fmt.Errorf("mail.tm 邮箱状态无效")
-	}
-	status, body, err := s.mailTMGetLocked("/messages?page=1", s.token)
-	if err != nil {
-		return "", nil, fmt.Errorf("读取 mail.tm 消息失败: %w", err)
-	}
-	if status < 200 || status >= 300 {
-		return "", nil, fmt.Errorf("读取 mail.tm 消息失败: %d %s", status, truncate(body, 200))
-	}
-
-	var resp mailTMHydraResp
-	if err := json.Unmarshal([]byte(body), &resp); err != nil {
-		return "", nil, fmt.Errorf("解析 mail.tm 消息列表失败: %w", err)
-	}
-
-	rows := make([]tempMailRow, 0, len(resp.Members))
-	for idx, msg := range resp.Members {
-		id := strings.TrimSpace(strFromAny(msg["id"]))
-		if id == "" {
-			id = fmt.Sprintf("row-%d", idx)
-		}
-
-		received := strings.TrimSpace(pickFirstNonEmpty(
-			strFromAny(msg["createdAt"]),
-			strFromAny(msg["created_at"]),
-			strFromAny(msg["date"]),
-		))
-
-		text := ""
-		if b, err := json.Marshal(msg); err == nil {
-			text = string(b)
-		}
-
-		if extractTempMailCode(text, len(resp.Members)) == "" && isTempMailCodeCandidate(text) {
-			if s.detailCache == nil {
-				s.detailCache = make(map[string]string)
-			}
-			if cached := strings.TrimSpace(s.detailCache[id]); cached != "" {
-				text = cached
-			} else {
-				detailPath := "/messages/" + url.PathEscape(id)
-				ds, db, derr := s.mailTMGetLocked(detailPath, s.token)
-				if derr == nil && ds >= 200 && ds < 300 {
-					text = db
-					s.detailCache[id] = db
-				}
-			}
-		}
-
-		rows = append(rows, tempMailRow{
-			ID:       id,
-			Received: received,
-			Text:     text,
-		})
-	}
-	return s.currentMailbox, rows, nil
-}
-
-func (s *TempMailService) mailTMGetLocked(path, bearer string) (int, string, error) {
+func (s *TempMailService) tempmailLOLGetLocked(path string, query url.Values) (int, string, error) {
 	if s.httpClient == nil {
 		return 0, "", fmt.Errorf("temp-mail client is nil")
 	}
-	req, err := fhttp.NewRequest("GET", mailTMAPIBase+path, nil)
+	base := strings.TrimRight(strings.TrimSpace(s.apiBaseURL), "/")
+	if base == "" {
+		base = tempmailLOLAPIBase
+	}
+	rawURL := base + path
+	if len(query) > 0 {
+		rawURL += "?" + query.Encode()
+	}
+	req, err := fhttp.NewRequest("GET", rawURL, nil)
 	if err != nil {
 		return 0, "", err
 	}
 	req.Header = fhttp.Header{
 		"user-agent":      {s.httpClient.userAgent},
-		"accept":          {"application/ld+json, application/json;q=0.9, */*;q=0.8"},
+		"accept":          {"application/json"},
 		"accept-language": {"en-US,en;q=0.9"},
 		"accept-encoding": {"gzip, deflate, br"},
-	}
-	if strings.TrimSpace(bearer) != "" {
-		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(bearer))
 	}
 	resp, err := s.httpClient.client.Do(req)
 	if err != nil {
@@ -611,24 +350,25 @@ func (s *TempMailService) mailTMGetLocked(path, bearer string) (int, string, err
 	return resp.StatusCode, string(b), nil
 }
 
-func (s *TempMailService) mailTMPostJSONLocked(path string, payload interface{}, bearer string) (int, string, error) {
+func (s *TempMailService) tempmailLOLPostJSONLocked(path string, payload interface{}) (int, string, error) {
 	if s.httpClient == nil {
 		return 0, "", fmt.Errorf("temp-mail client is nil")
 	}
+	base := strings.TrimRight(strings.TrimSpace(s.apiBaseURL), "/")
+	if base == "" {
+		base = tempmailLOLAPIBase
+	}
 	b, _ := json.Marshal(payload)
-	req, err := fhttp.NewRequest("POST", mailTMAPIBase+path, strings.NewReader(string(b)))
+	req, err := fhttp.NewRequest("POST", base+path, strings.NewReader(string(b)))
 	if err != nil {
 		return 0, "", err
 	}
 	req.Header = fhttp.Header{
 		"user-agent":      {s.httpClient.userAgent},
-		"accept":          {"application/ld+json, application/json;q=0.9, */*;q=0.8"},
+		"accept":          {"application/json"},
 		"content-type":    {"application/json"},
 		"accept-language": {"en-US,en;q=0.9"},
 		"accept-encoding": {"gzip, deflate, br"},
-	}
-	if strings.TrimSpace(bearer) != "" {
-		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(bearer))
 	}
 	resp, err := s.httpClient.client.Do(req)
 	if err != nil {
@@ -640,35 +380,124 @@ func (s *TempMailService) mailTMPostJSONLocked(path string, payload interface{},
 	return resp.StatusCode, string(body), nil
 }
 
+func decodeTempmailLOLInbox(body string, fallbackMailbox string) (string, []tempMailRow, error) {
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &raw); err != nil {
+		return "", nil, fmt.Errorf("解析 tempmail.lol 收件箱失败: %w", err)
+	}
+	if len(raw) == 0 {
+		return "", nil, fmt.Errorf("tempmail.lol 收件箱为空或已过期")
+	}
+
+	mailbox := strings.TrimSpace(pickFirstNonEmpty(
+		strFromAny(raw["address"]),
+		strFromAny(raw["mailbox"]),
+		fallbackMailbox,
+	))
+
+	rawEmails, _ := raw["emails"].([]interface{})
+	rows := make([]tempMailRow, 0, len(rawEmails))
+	for idx, item := range rawEmails {
+		msg, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		row := tempMailRow{
+			ID: strings.TrimSpace(pickFirstNonEmpty(
+				strFromAny(msg["id"]),
+				strFromAny(msg["_id"]),
+				strFromAny(msg["date"]),
+			)),
+			Received: strings.TrimSpace(pickFirstNonEmpty(
+				strFromAny(msg["date"]),
+				strFromAny(msg["created_at"]),
+				strFromAny(msg["createdAt"]),
+				strFromAny(msg["timestamp"]),
+			)),
+		}
+		if row.ID == "" {
+			row.ID = fmt.Sprintf("row-%d", idx)
+		}
+		if b, err := json.Marshal(msg); err == nil {
+			row.Text = string(b)
+		}
+		rows = append(rows, row)
+	}
+	return mailbox, rows, nil
+}
+
+func (s *TempMailService) fetchRowsLocked() (string, []tempMailRow, error) {
+	return s.fetchRowsTempmailLOLLocked()
+}
+
+func (s *TempMailService) createTempmailLOLMailboxLocked() error {
+	status, body, err := s.tempmailLOLPostJSONLocked("/inbox/create", map[string]interface{}{})
+	if err != nil {
+		return fmt.Errorf("请求 tempmail.lol mailbox 失败: %w", err)
+	}
+	if status != 200 && status != 201 {
+		return fmt.Errorf("请求 tempmail.lol mailbox 失败: %d %s", status, truncate(body, 200))
+	}
+
+	var resp tempmailLOLMailboxResp
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		return fmt.Errorf("解析 tempmail.lol mailbox 失败: %w", err)
+	}
+	resp.Address = strings.TrimSpace(resp.Address)
+	resp.Token = strings.TrimSpace(resp.Token)
+	if !isValidMailbox(resp.Address) || resp.Token == "" {
+		return fmt.Errorf("tempmail.lol 未返回可用邮箱")
+	}
+
+	s.provider = "tempmail-lol"
+	s.token = resp.Token
+	s.currentMailbox = resp.Address
+	s.lastCreatedAt = time.Now()
+	s.detailCache = nil
+	s.saveSessionLocked()
+	return nil
+}
+
+func (s *TempMailService) fetchRowsTempmailLOLLocked() (string, []tempMailRow, error) {
+	if strings.TrimSpace(s.token) == "" {
+		return "", nil, fmt.Errorf("tempmail.lol token 为空")
+	}
+	query := url.Values{"token": []string{strings.TrimSpace(s.token)}}
+	status, body, err := s.tempmailLOLGetLocked("/inbox", query)
+	if err != nil {
+		return "", nil, fmt.Errorf("读取 tempmail.lol 消息失败: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return "", nil, fmt.Errorf("读取 tempmail.lol 消息失败: %d %s", status, truncate(body, 200))
+	}
+
+	mailbox, rows, err := decodeTempmailLOLInbox(body, s.currentMailbox)
+	if err != nil {
+		return "", nil, err
+	}
+	if isValidMailbox(mailbox) {
+		s.currentMailbox = mailbox
+		s.saveSessionLocked()
+	}
+	return mailbox, rows, nil
+}
+
 func (s *TempMailService) validateCurrentMailboxLocked() bool {
 	if !isValidMailbox(s.currentMailbox) || s.httpClient == nil {
 		return false
 	}
-	if strings.EqualFold(s.provider, "mailtm") {
-		if strings.TrimSpace(s.token) == "" {
-			return false
-		}
-		status, _, err := s.mailTMGetLocked("/messages?page=1", s.token)
-		if err != nil {
-			return false
-		}
-		return status >= 200 && status < 300
+	if s.isBlockedDomainLocked(mailboxDomain(s.currentMailbox)) {
+		return false
 	}
 	if strings.TrimSpace(s.token) == "" {
 		return false
 	}
-	status, _, err := s.tempMailGetLocked("/messages")
+	query := url.Values{"token": []string{strings.TrimSpace(s.token)}}
+	status, _, err := s.tempmailLOLGetLocked("/inbox", query)
 	if err != nil {
 		return false
 	}
-	if status >= 200 && status < 300 {
-		return true
-	}
-	// 消息端限流时，不丢弃已缓存的邮箱，继续后续轮询重试
-	if status == 429 {
-		return true
-	}
-	return false
+	return status >= 200 && status < 300
 }
 
 func (s *TempMailService) sessionFilePathLocked() string {
@@ -689,16 +518,16 @@ func (s *TempMailService) loadSessionLocked() bool {
 	if err := json.Unmarshal(b, &sess); err != nil {
 		return false
 	}
-	if strings.TrimSpace(sess.Provider) == "" {
-		sess.Provider = "temp-mail"
+	if provider := strings.TrimSpace(sess.Provider); provider != "" && !strings.EqualFold(provider, "tempmail-lol") {
+		return false
 	}
-	s.provider = strings.TrimSpace(sess.Provider)
+	s.provider = "tempmail-lol"
 	sess.Token = strings.TrimSpace(sess.Token)
 	sess.Mailbox = strings.TrimSpace(sess.Mailbox)
 	if !isValidMailbox(sess.Mailbox) {
 		return false
 	}
-	if !strings.EqualFold(s.provider, "mailtm") && sess.Token == "" {
+	if sess.Token == "" {
 		return false
 	}
 	s.token = sess.Token
@@ -710,13 +539,13 @@ func (s *TempMailService) saveSessionLocked() {
 	if !isValidMailbox(s.currentMailbox) {
 		return
 	}
-	if !strings.EqualFold(s.provider, "mailtm") && strings.TrimSpace(s.token) == "" {
+	if strings.TrimSpace(s.token) == "" {
 		return
 	}
 	path := s.sessionFilePathLocked()
 	_ = os.MkdirAll(filepath.Dir(path), 0755)
 	payload := tempMailSession{
-		Provider:  firstNonEmpty(strings.TrimSpace(s.provider), "temp-mail"),
+		Provider:  "tempmail-lol",
 		Token:     strings.TrimSpace(s.token),
 		Mailbox:   strings.TrimSpace(s.currentMailbox),
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
@@ -741,15 +570,15 @@ func (s *TempMailService) FindCode(expectedEmail string, minTime time.Time, seen
 		return "", err
 	}
 	if expectedEmail != "" && isValidMailbox(mailbox) && !strings.EqualFold(expectedEmail, mailbox) {
-		return "", fmt.Errorf("temp-mail 当前邮箱变更: expected=%s current=%s", expectedEmail, mailbox)
+		return "", fmt.Errorf("tempmail.lol 当前邮箱变更: expected=%s current=%s", expectedEmail, mailbox)
 	}
 
 	return findBestTempMailCode(rows, minTime, seen), nil
 }
 
-func waitForTempMailCode(email string, otpSentAt time.Time, resendFn func() bool) (string, error) {
+func waitForTempMailCode(email string, otpSentAt time.Time, resendFn func() bool, waitMode otpWaitMode) (string, error) {
 	integratedIMAP.ConsumeCode(strings.ToLower(email), "")
-	minTime := otpSentAt.Add(-60 * time.Second)
+	minTime := otpMinTime(otpSentAt, waitMode)
 
 	done := make(chan struct{})
 	defer close(done)
@@ -799,7 +628,7 @@ func waitForTempMailCode(email string, otpSentAt time.Time, resendFn func() bool
 			if code == "" {
 				return
 			}
-			if _, injectErr := integratedIMAP.InjectManualCode(email, code, "temp-mail"); injectErr != nil {
+			if _, injectErr := integratedIMAP.InjectManualCode(email, code, "tempmail.lol"); injectErr != nil {
 				if time.Since(lastWarnAt) > 10*time.Second {
 					broadcast(fmt.Sprintf("    ⚠️ Temp Mail 注入验证码失败: %s", truncate(injectErr.Error(), 120)), "warning")
 					lastWarnAt = time.Now()

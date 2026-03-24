@@ -7,6 +7,12 @@
 > 项目仅供参考学习，请勿滥用！！！
 ---
 
+## 当前维护说明
+
+- 当前 Git 根目录就是本项目根目录，不再只有 `api-register-go/` 单独作为仓库。
+- `api-register-go/` 当前默认采用 `create_account -> login -> password -> OTP -> token/workspace` 的后置重登链路。
+- 也就是说，只有在 `create_account` 成功后，才会自动切入重新登录流程获取最终 `workspace/token`，不再依赖额外的 Dashboard 开关。
+
 ## 目录结构
 
 ```
@@ -41,7 +47,8 @@ openai-auto-register/
 - 🔐 Outlook 账号支持 **XOAUTH2** 和密码两种 IMAP 认证
 - 📧 内置集成 IMAP 服务，支持域名邮箱 catch-all
 - 🌐 内置 Web 控制台（端口 `8899`），实时 SSE 日志
-- 🔄 支持 **注册模式** 和 **登录刷新 Token 模式**
+- 🔄 新账号默认在 `create_account` 成功后自动走 `login -> password -> OTP -> token/workspace`
+- 🧪 Temp Mail 流程已切到 `tempmail.lol`
 
 ### 使用方法
 
@@ -49,6 +56,8 @@ openai-auto-register/
 2. 双击运行 `register.exe`（或命令行执行）
 3. 浏览器打开 `http://localhost:8899`
 4. 在界面中填入账号列表，选择参数，点击开始
+
+> Go 控制台不再提供额外的“注册转登录”按钮；当前默认策略就是账号创建成功后自动重启登录流程，尽量绕开 `add_phone` 后直接取 workspace 的不稳定路径。
 
 ### 账号格式
 
@@ -175,6 +184,10 @@ python -m playwright install chromium
 
 ## 注意事项
 - 📋 Outlook 账号需要在 Microsoft 开发者平台申请 `client_id` 并获取 `refresh_token` 方可使用 XOAUTH2
+
+## 鸣谢
+
+- 部分 Temp Mail 接入、注册成功后重新登录获取 `workspace/token` 的修正思路，参考了 [`moeacgx/codex-manager`](https://github.com/moeacgx/codex-manager)。
 
 ---
 

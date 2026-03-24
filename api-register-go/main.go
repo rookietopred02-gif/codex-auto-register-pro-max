@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,7 +40,8 @@ const (
 	OAISentinelURL       = "https://sentinel.openai.com/backend-api/sentinel/req"
 	OAISignupURL         = "https://auth.openai.com/api/accounts/authorize/continue"
 	OAIUserRegisterURL   = "https://auth.openai.com/api/accounts/user/register"
-	OAISendOTPURL        = "https://auth.openai.com/api/accounts/passwordless/send-otp"
+	OAIPasswordVerifyURL = "https://auth.openai.com/api/accounts/password/verify"
+	OAIEmailOTPSendURL   = "https://auth.openai.com/api/accounts/email-otp/send"
 	OAIEmailOTPResendURL = "https://auth.openai.com/api/accounts/email-otp/resend"
 	OAIVerifyURL         = "https://auth.openai.com/api/accounts/email-otp/validate"
 	OAICreateURL         = "https://auth.openai.com/api/accounts/create_account"
@@ -53,14 +55,36 @@ const (
 	MaxRetry       = 2
 )
 
+type otpWaitMode int
+
+const (
+	otpWaitAllowClockSkew otpWaitMode = iota
+	otpWaitRequireFreshCode
+)
+
+func otpMinTime(otpSentAt time.Time, mode otpWaitMode) time.Time {
+	if otpSentAt.IsZero() {
+		return time.Time{}
+	}
+	if mode == otpWaitRequireFreshCode {
+		return otpSentAt
+	}
+	return otpSentAt.Add(-60 * time.Second)
+}
+
+func shouldReloginAfterCreateAccount(isExisting, isLogin bool) bool {
+	return !isExisting && isLogin
+}
+
 // ═══════════════════════════════════════════════════════
 // 数据结构
 // ═══════════════════════════════════════════════════════
 type Account struct {
-	Email        string `json:"email"`
-	Password     string `json:"password"`
-	ClientID     string `json:"client_id,omitempty"`
-	RefreshToken string `json:"refresh_token,omitempty"`
+	Email            string `json:"email"`
+	Password         string `json:"password"`
+	RegisterPassword string `json:"register_password,omitempty"`
+	ClientID         string `json:"client_id,omitempty"`
+	RefreshToken     string `json:"refresh_token,omitempty"`
 }
 
 type DomainMailConfig struct {
@@ -88,13 +112,14 @@ func (c *DomainMailConfig) IMAPPass() string {
 }
 
 type StartRequest struct {
-	Accounts     string            `json:"accounts"`
-	Proxy        string            `json:"proxy"`
-	Workers      int               `json:"workers"`
-	LoginMode    bool              `json:"login_mode"`
-	SkipFinished bool              `json:"skip_finished"`
-	DomainMail   *DomainMailConfig `json:"domain_mail,omitempty"`
-	TempMail     *TempMailConfig   `json:"temp_mail,omitempty"`
+	Accounts                string            `json:"accounts"`
+	Proxy                   string            `json:"proxy"`
+	Workers                 int               `json:"workers"`
+	Language                string            `json:"language,omitempty"`
+	SkipFinished            bool              `json:"skip_finished"`
+	OutlookRegisterPassword string            `json:"outlook_register_password,omitempty"`
+	DomainMail              *DomainMailConfig `json:"domain_mail,omitempty"`
+	TempMail                *TempMailConfig   `json:"temp_mail,omitempty"`
 }
 
 type RegResult struct {
@@ -131,6 +156,7 @@ var (
 	sseClientsLock sync.Mutex
 
 	resultsDir string
+	runtimeDir string
 )
 
 // ═══════════════════════════════════════════════════════
@@ -244,6 +270,23 @@ type HTTPClient struct {
 	userAgent string
 }
 
+var unsupportedIPLocations = map[string]struct{}{
+	"CN": {},
+	"HK": {},
+	"MO": {},
+	"TW": {},
+}
+
+var (
+	cloudflareLocRe = regexp.MustCompile(`(?m)^loc=([A-Z]+)$`)
+	emailCodeRe     = regexp.MustCompile(`\b(\d{6})\b`)
+)
+
+func isUnsupportedIPLocation(loc string) bool {
+	_, blocked := unsupportedIPLocations[strings.TrimSpace(strings.ToUpper(loc))]
+	return blocked
+}
+
 func NewHTTPClient(proxy string) (*HTTPClient, error) {
 	profile := tlsProfiles[rand.Intn(len(tlsProfiles))]
 	ua := userAgents[rand.Intn(len(userAgents))]
@@ -329,8 +372,15 @@ func (h *HTTPClient) setPostHeaders(req *fhttp.Request, contentType string, extr
 }
 
 func (h *HTTPClient) Get(rawURL string) (int, string, error) {
+	return h.GetWithHeaders(rawURL, nil)
+}
+
+func (h *HTTPClient) GetWithHeaders(rawURL string, extraHeaders map[string]string) (int, string, error) {
 	req, _ := fhttp.NewRequest("GET", rawURL, nil)
 	h.setGetHeaders(req)
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
+	}
 	resp, err := h.client.Do(req)
 	if err != nil {
 		return 0, "", err
@@ -404,6 +454,27 @@ func (h *HTTPClient) saveCookies(resp *fhttp.Response) {
 	}
 }
 
+func (h *HTTPClient) CheckIPLocation() (bool, string, error) {
+	status, body, err := h.Get("https://cloudflare.com/cdn-cgi/trace")
+	if err != nil {
+		return false, "", err
+	}
+	if status < 200 || status >= 300 {
+		return false, "", fmt.Errorf("cloudflare trace failed: %d %s", status, truncate(body, 120))
+	}
+
+	match := cloudflareLocRe.FindStringSubmatch(body)
+	if len(match) < 2 {
+		return false, "", fmt.Errorf("cloudflare trace missing loc")
+	}
+
+	loc := strings.TrimSpace(match[1])
+	if isUnsupportedIPLocation(loc) {
+		return false, loc, nil
+	}
+	return true, loc, nil
+}
+
 // ═══════════════════════════════════════════════════════
 // 注册流程 (核心)
 // ═══════════════════════════════════════════════════════
@@ -425,87 +496,185 @@ func registerAccount(acc Account, proxy string, mode string, domainMail *DomainM
 	isLogin := mode == "login"
 	modeLabel := "注册"
 	if isLogin {
-		modeLabel = "登录"
+		modeLabel = "注册转登录"
 	}
-
-	if gStopFlag.Load() {
-		return nil, fmt.Errorf("已取消")
-	}
-
-	httpClient, err := NewHTTPClient(proxy)
+	password := ""
+	currentClientLabel := "注册"
+	var err error
+	password, err = resolveRegisterPassword(acc, domainMail, tempMail)
 	if err != nil {
-		return nil, fmt.Errorf("创建 HTTP 客户端失败: %w", err)
+		return nil, err
 	}
-	broadcast(fmt.Sprintf("  🎭 浏览器指纹: %s", httpClient.profile), "dim")
 
-	// --- Step 1: OAuth ---
 	if gStopFlag.Load() {
 		return nil, fmt.Errorf("已取消")
 	}
-	authURL, state, verifier := createOAuthParams()
-	broadcast(fmt.Sprintf("  [1] 发起 OAuth (%s)...", modeLabel), "info")
-	status, _, err := httpClient.Get(authURL)
+
+	newHTTPClient := func() (*HTTPClient, error) {
+		client, err := NewHTTPClient(proxy)
+		if err != nil {
+			return nil, fmt.Errorf("创建 HTTP 客户端失败: %w", err)
+		}
+		broadcast(fmt.Sprintf("  🎭 浏览器指纹: %s", client.profile), "dim")
+		return client, nil
+	}
+
+	buildSentinelHeader := func(deviceID string, client *HTTPClient) (string, error) {
+		broadcast("  [2] 获取 Sentinel token...", "info")
+		sentinelBody := map[string]interface{}{"p": "", "id": deviceID, "flow": "authorize_continue"}
+		sStatus, sBody, err := client.PostJSON(OAISentinelURL, sentinelBody, map[string]string{
+			"Origin":  "https://sentinel.openai.com",
+			"Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
+		})
+		if err != nil || sStatus < 200 || sStatus >= 300 {
+			return "", fmt.Errorf("Sentinel 失败: %d %s", sStatus, truncate(sBody, 200))
+		}
+		var sentinelResp map[string]interface{}
+		_ = json.Unmarshal([]byte(sBody), &sentinelResp)
+		sentinelToken, _ := sentinelResp["token"].(string)
+		sentinelHeader, _ := json.Marshal(map[string]interface{}{
+			"p": "", "t": "", "c": sentinelToken, "id": deviceID, "flow": "authorize_continue",
+		})
+		broadcast("      OK", "dim")
+		sleepFlow(tempMode, 200, 450)
+		return string(sentinelHeader), nil
+	}
+
+	startOAuthFlow := func(client *HTTPClient, label string) (string, string, string, error) {
+		if gStopFlag.Load() {
+			return "", "", "", fmt.Errorf("已取消")
+		}
+		authURL, state, verifier := createOAuthParams()
+		broadcast(fmt.Sprintf("  [1] 发起 OAuth (%s)...", label), "info")
+		status, _, err := client.Get(authURL)
+		if err != nil {
+			return "", "", "", fmt.Errorf("OAuth 失败: %w", err)
+		}
+		broadcast(fmt.Sprintf("      状态: %d", status), "dim")
+
+		deviceID := client.GetCookie("oai-did")
+		if deviceID != "" {
+			broadcast(fmt.Sprintf("      设备ID: %s...", deviceID[:min(16, len(deviceID))]), "dim")
+		}
+		sleepFlow(tempMode, 400, 900)
+
+		sentinelHeader, err := buildSentinelHeader(deviceID, client)
+		if err != nil {
+			return "", "", "", err
+		}
+		return state, verifier, sentinelHeader, nil
+	}
+
+	submitAuthStart := func(client *HTTPClient, sentinelHeader, screenHint, referer, label string) (map[string]interface{}, string, string, error) {
+		if gStopFlag.Load() {
+			return nil, "", "", fmt.Errorf("已取消")
+		}
+		broadcast(fmt.Sprintf("  [3] %s: %s (%s)", label, email, currentClientLabel), "info")
+		body := map[string]interface{}{
+			"username":    map[string]interface{}{"value": email, "kind": "email"},
+			"screen_hint": screenHint,
+		}
+		status, respBody, err := client.PostJSON(OAISignupURL, body, map[string]string{
+			"Referer":               referer,
+			"openai-sentinel-token": sentinelHeader,
+		})
+		if err != nil || status < 200 || status >= 300 {
+			return nil, "", "", fmt.Errorf("%s失败: %d %s", label, status, truncate(respBody, 300))
+		}
+		broadcast("      OK", "dim")
+
+		data := decodeJSONMapBody(respBody)
+		pageType := extractPageType(data)
+		continueURL := extractContinueURL(data)
+		broadcast(fmt.Sprintf("      页面类型: %s", pageType), "dim")
+		sleepFlow(tempMode, 200, 450)
+		return data, pageType, continueURL, nil
+	}
+
+	submitLoginPassword := func(client *HTTPClient, loginPassword string) (map[string]interface{}, string, error) {
+		if gStopFlag.Load() {
+			return nil, "", fmt.Errorf("已取消")
+		}
+		broadcast("  [4] 提交登录密码...", "info")
+		status, body, err := client.PostJSON(OAIPasswordVerifyURL, map[string]interface{}{
+			"password": loginPassword,
+		}, map[string]string{
+			"Referer": "https://auth.openai.com/log-in/password",
+		})
+		if err != nil || status < 200 || status >= 300 {
+			return nil, "", fmt.Errorf("提交登录密码失败: %d %s", status, truncate(body, 300))
+		}
+		data := decodeJSONMapBody(body)
+		pageType := extractPageType(data)
+		broadcast("      OK", "dim")
+		broadcast(fmt.Sprintf("      下一页面: %s", pageType), "dim")
+		sleepFlow(tempMode, 180, 320)
+		return data, pageType, nil
+	}
+
+	sendEmailOTP := func(client *HTTPClient, referer string) error {
+		if gStopFlag.Load() {
+			return fmt.Errorf("已取消")
+		}
+		broadcast("  [4] 发送 OTP...", "info")
+		status, body, err := client.GetWithHeaders(OAIEmailOTPSendURL, map[string]string{
+			"Referer": referer,
+			"Accept":  "application/json",
+		})
+		if err != nil || status < 200 || status >= 300 {
+			return fmt.Errorf("发送 OTP 失败: %d %s", status, truncate(body, 300))
+		}
+		broadcast(fmt.Sprintf("      OK，验证码已发送到 %s", email), "dim")
+		return nil
+	}
+
+	fetchPostCreateContinue := func(client *HTTPClient, continueURL string) (map[string]interface{}, string, error) {
+		if strings.TrimSpace(continueURL) == "" {
+			return nil, "", nil
+		}
+		status, body, err := client.Get(continueURL)
+		if err != nil {
+			broadcast(fmt.Sprintf("      访问账户创建后续页面失败: %v", err), "warn")
+			return nil, "", nil
+		}
+		broadcast(fmt.Sprintf("      账户创建后续页面状态: %d", status), "dim")
+		return decodeJSONMapBody(body), body, nil
+	}
+
+	httpClient, err := newHTTPClient()
 	if err != nil {
-		return nil, fmt.Errorf("OAuth 失败: %w", err)
+		return nil, err
 	}
-	broadcast(fmt.Sprintf("      状态: %d", status), "dim")
 
-	deviceID := httpClient.GetCookie("oai-did")
-	if deviceID != "" {
-		broadcast(fmt.Sprintf("      设备ID: %s...", deviceID[:min(16, len(deviceID))]), "dim")
+	broadcast("  [0] 检查 IP 地理位置...", "info")
+	ipOK, location, err := httpClient.CheckIPLocation()
+	if err != nil {
+		return nil, fmt.Errorf("检查 IP 地理位置失败: %w", err)
 	}
-	sleepFlow(tempMode, 800, 2000)
+	if !ipOK {
+		return nil, fmt.Errorf("IP 地理位置不支持: %s", location)
+	}
+	broadcast(fmt.Sprintf("      IP 位置: %s", location), "dim")
 
-	// --- Step 2: Sentinel ---
-	if gStopFlag.Load() {
-		return nil, fmt.Errorf("已取消")
+	state, verifier, sentinelHeader, err := startOAuthFlow(httpClient, modeLabel)
+	if err != nil {
+		return nil, err
 	}
-	broadcast("  [2] 获取 Sentinel token...", "info")
-	sentinelBody := map[string]interface{}{"p": "", "id": deviceID, "flow": "authorize_continue"}
-	sStatus, sBody, err := httpClient.PostJSON(OAISentinelURL, sentinelBody, map[string]string{
-		"Origin":  "https://sentinel.openai.com",
-		"Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
-	})
-	if err != nil || sStatus < 200 || sStatus >= 300 {
-		return nil, fmt.Errorf("Sentinel 失败: %d %s", sStatus, truncate(sBody, 200))
-	}
-	var sentinelResp map[string]interface{}
-	json.Unmarshal([]byte(sBody), &sentinelResp)
-	sentinelToken, _ := sentinelResp["token"].(string)
-	sentinelHeader, _ := json.Marshal(map[string]interface{}{
-		"p": "", "t": "", "c": sentinelToken, "id": deviceID, "flow": "authorize_continue",
-	})
-	broadcast("      OK", "dim")
-	sleepFlow(tempMode, 500, 1500)
 
 	// 对应 Python: otp_sent_at = time.time() 在提交邮箱之前
 	// 已注册账号在步骤3提交邮箱时自动发送OTP，所以需要在步骤3之前记录时间
 	otpSentAt := time.Now()
 
-	// --- Step 3: Submit email ---
-	if gStopFlag.Load() {
-		return nil, fmt.Errorf("已取消")
+	_, pageType, step3ContinueURL, err := submitAuthStart(
+		httpClient,
+		sentinelHeader,
+		"signup",
+		"https://auth.openai.com/create-account",
+		"提交邮箱",
+	)
+	if err != nil {
+		return nil, err
 	}
-	broadcast(fmt.Sprintf("  [3] 提交邮箱: %s (%s)", email, modeLabel), "info")
-	signupBody := map[string]interface{}{
-		"username":    map[string]interface{}{"value": email, "kind": "email"},
-		"screen_hint": "signup",
-	}
-	s3Status, s3Body, err := httpClient.PostJSON(OAISignupURL, signupBody, map[string]string{
-		"Referer":               "https://auth.openai.com/create-account",
-		"openai-sentinel-token": string(sentinelHeader),
-	})
-	if err != nil || s3Status < 200 || s3Status >= 300 {
-		return nil, fmt.Errorf("提交邮箱失败: %d %s", s3Status, truncate(s3Body, 300))
-	}
-	broadcast("      OK", "dim")
-
-	var step3Data map[string]interface{}
-	json.Unmarshal([]byte(s3Body), &step3Data)
-	pageType := extractPageType(step3Data)
-	step3ContinueURL := strFromMap(step3Data, "continue_url")
-	broadcast(fmt.Sprintf("      页面类型: %s", pageType), "dim")
-	sleepFlow(tempMode, 500, 1500)
 
 	isExisting := pageType == "email_otp_verification"
 	otpResendMode := ""
@@ -514,8 +683,8 @@ func registerAccount(acc Account, proxy string, mode string, domainMail *DomainM
 	if gStopFlag.Load() {
 		return nil, fmt.Errorf("已取消")
 	}
-	switch pageType {
-	case "create_account_password":
+	switch {
+	case pageType == "create_account_password":
 		if step3ContinueURL != "" {
 			status, _, err := httpClient.Get(step3ContinueURL)
 			if err != nil {
@@ -524,12 +693,7 @@ func registerAccount(acc Account, proxy string, mode string, domainMail *DomainM
 			if status < 200 || status >= 400 {
 				return nil, fmt.Errorf("访问密码注册页失败: %d", status)
 			}
-			sleepFlow(tempMode, 300, 900)
-		}
-
-		password, err := normalizeRegisterPassword(acc.Password)
-		if err != nil {
-			return nil, err
+			sleepFlow(tempMode, 80, 180)
 		}
 
 		broadcast("  [4] 提交注册密码...", "info")
@@ -562,29 +726,17 @@ func registerAccount(acc Account, proxy string, mode string, domainMail *DomainM
 			}
 		}
 
-		if pageType == "email_otp_send" || pageType == "email_otp_verification" {
-			otpResendMode = "email_otp"
-			otpSentAt = time.Now()
+		if err := sendEmailOTP(httpClient, "https://auth.openai.com/create-account/password"); err != nil {
+			return nil, err
 		}
-		sleepFlow(tempMode, 500, 1200)
-	case "email_otp_verification":
+		otpSentAt = time.Now()
+		otpResendMode = "email_otp"
+		sleepFlow(tempMode, 180, 320)
+	case isExisting:
 		broadcast("  [4] 跳过发送 OTP（服务器已自动发送）", "info")
 		otpResendMode = "email_otp"
 	default:
-		broadcast("  [4] 发送 OTP...", "info")
-		o4Status, o4Body, err := httpClient.PostJSON(OAISendOTPURL, map[string]interface{}{}, map[string]string{
-			"Referer": "https://auth.openai.com/create-account/password",
-		})
-		if err != nil {
-			return nil, fmt.Errorf("发送 OTP 失败: %w", err)
-		}
-		if o4Status < 200 || o4Status >= 300 {
-			return nil, fmt.Errorf("发送 OTP 失败: %d %s", o4Status, truncate(o4Body, 300))
-		} else {
-			broadcast(fmt.Sprintf("      OK，验证码已发送到 %s", email), "dim")
-			otpSentAt = time.Now()
-			otpResendMode = "passwordless"
-		}
+		return nil, fmt.Errorf("当前注册流未进入可处理页面: %s", pageType)
 	}
 
 	// --- Step 5: Get code ---
@@ -600,20 +752,13 @@ func registerAccount(acc Account, proxy string, mode string, domainMail *DomainM
 	broadcast(fmt.Sprintf("    📧 等待验证码 (%s, %s)...", email, codeSource), "info")
 
 	resendFn := func() bool {
-		switch otpResendMode {
-		case "email_otp":
-			s, _, _ := httpClient.PostJSON(OAIEmailOTPResendURL, map[string]interface{}{}, map[string]string{
-				"Referer": "https://auth.openai.com/email-verification",
-			})
-			return s >= 200 && s < 300
-		case "passwordless":
-			s, _, _ := httpClient.PostJSON(OAISendOTPURL, map[string]interface{}{}, map[string]string{
-				"Referer": "https://auth.openai.com/email-verification",
-			})
-			return s >= 200 && s < 300
-		default:
+		if otpResendMode != "email_otp" {
 			return false
 		}
+		s, _, _ := httpClient.PostJSON(OAIEmailOTPResendURL, map[string]interface{}{}, map[string]string{
+			"Referer": "https://auth.openai.com/email-verification",
+		})
+		return s >= 200 && s < 300
 	}
 
 	if !isExisting && otpResendMode == "" {
@@ -622,13 +767,13 @@ func registerAccount(acc Account, proxy string, mode string, domainMail *DomainM
 
 	var code string
 	if tempMail != nil {
-		code, err = waitForTempMailCode(email, otpSentAt, resendFn)
+		code, err = waitForTempMailCode(email, otpSentAt, resendFn, otpWaitAllowClockSkew)
 	} else if domainMail != nil {
 		// 域名邮箱模式：使用集成 IMAP 服务
-		code, err = waitForCode(email, otpSentAt, resendFn)
+		code, err = waitForCode(email, otpSentAt, resendFn, otpWaitAllowClockSkew)
 	} else {
 		// Outlook 模式：用账号自己的邮箱 IMAP
-		code, err = fetchOutlookCode(acc, otpSentAt, resendFn)
+		code, err = fetchOutlookCode(acc, otpSentAt, resendFn, otpWaitAllowClockSkew)
 	}
 	if err != nil {
 		return nil, err
@@ -637,7 +782,7 @@ func registerAccount(acc Account, proxy string, mode string, domainMail *DomainM
 	if gStopFlag.Load() {
 		return nil, fmt.Errorf("已取消")
 	}
-	sleepFlow(tempMode, 300, 1000)
+	sleepFlow(tempMode, 100, 220)
 
 	// --- Step 6: Verify OTP ---
 	if gStopFlag.Load() {
@@ -651,14 +796,19 @@ func registerAccount(acc Account, proxy string, mode string, domainMail *DomainM
 		return nil, fmt.Errorf("OTP 验证失败: %d %s", v6Status, truncate(v6Body, 300))
 	}
 	broadcast("      OK", "dim")
-	sleepFlow(tempMode, 500, 1500)
+	sleepFlow(tempMode, 180, 360)
 
 	// --- Step 7: Create account ---
 	name := ""
+	var createAccountData map[string]interface{}
+	var postCreateContinueData map[string]interface{}
+	var createAccountBody string
+	var postCreateContinueBody string
+	shouldRelogin := shouldReloginAfterCreateAccount(isExisting, isLogin)
 	if gStopFlag.Load() {
 		return nil, fmt.Errorf("已取消")
 	}
-	if isExisting || isLogin {
+	if isExisting {
 		broadcast("  [7] 跳过（账号已存在）", "info")
 	} else {
 		name = randomName()
@@ -670,36 +820,143 @@ func registerAccount(acc Account, proxy string, mode string, domainMail *DomainM
 		if err != nil || c7Status < 200 || c7Status >= 300 {
 			return nil, fmt.Errorf("创建账号失败: %d %s", c7Status, truncate(c7Body, 300))
 		}
+		createAccountBody = c7Body
+		_ = json.Unmarshal([]byte(c7Body), &createAccountData)
+		if createPageType := extractPageTypeDetailed(createAccountData, extractContinueURL(createAccountData), c7Body); createPageType != "" {
+			broadcast(fmt.Sprintf("      账户创建后页面: %s", createPageType), "dim")
+		}
+		if !shouldRelogin {
+			if continueURL := extractContinueURL(createAccountData); continueURL != "" {
+				postCreateContinueData, postCreateContinueBody, err = fetchPostCreateContinue(httpClient, continueURL)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
 		broadcast("      OK", "dim")
-		sleepFlow(tempMode, 500, 1500)
+		sleepFlow(tempMode, 180, 360)
+	}
+
+	workspaceSourceCreateData := createAccountData
+	workspaceSourcePostCreateData := postCreateContinueData
+
+	// register->login 模式下，create_account 成功后就切到重新登录链路；
+	// 不再消费 post-create blocker/workspace 页面，避免被 add_phone 流程提前拦住。
+	if shouldRelogin {
+		workspaceSourceCreateData = nil
+		workspaceSourcePostCreateData = nil
+	} else if blockerPageType := extractWorkspaceBlockerPageTypeWithContext(
+		workspacePageContext{Data: createAccountData, ResponseURL: extractContinueURL(createAccountData), BodyText: createAccountBody},
+		workspacePageContext{Data: postCreateContinueData, ResponseURL: extractContinueURL(createAccountData), BodyText: postCreateContinueBody},
+	); blockerPageType != "" {
+		continueURL := extractContinueURL(createAccountData)
+		if continueURL != "" {
+			return nil, fmt.Errorf("账户创建后进入 %s 流程，当前尚未生成 workspace，需要先完成该流程: %s", blockerPageType, continueURL)
+		}
+		return nil, fmt.Errorf("账户创建后进入 %s 流程，当前尚未生成 workspace", blockerPageType)
 	}
 
 	// --- Step 8: Select workspace ---
-	authCookie := httpClient.GetCookie("oai-client-auth-session")
-	if authCookie == "" {
-		return nil, fmt.Errorf("未获取到 oai-client-auth-session cookie")
+	if shouldRelogin {
+		broadcast("  [8] 新账号已创建，重启登录流程以获取 workspace/token...", "info")
+		currentClientLabel = "重新登录"
+		httpClient, err = newHTTPClient()
+		if err != nil {
+			return nil, err
+		}
+
+		state, verifier, sentinelHeader, err = startOAuthFlow(httpClient, currentClientLabel)
+		if err != nil {
+			return nil, err
+		}
+
+		_, loginStartPageType, loginStartContinueURL, err := submitAuthStart(
+			httpClient,
+			sentinelHeader,
+			"login",
+			"https://auth.openai.com/log-in",
+			"提交登录入口",
+		)
+		if err != nil {
+			return nil, fmt.Errorf("重新登录提交邮箱失败: %w", err)
+		}
+		if loginStartContinueURL != "" {
+			status, _, getErr := httpClient.Get(loginStartContinueURL)
+			if getErr != nil {
+				return nil, fmt.Errorf("访问重新登录密码页失败: %w", getErr)
+			}
+			if status < 200 || status >= 400 {
+				return nil, fmt.Errorf("访问重新登录密码页失败: %d", status)
+			}
+			sleepFlow(tempMode, 80, 180)
+		}
+		if loginStartPageType != "login_password" {
+			return nil, fmt.Errorf("重新登录未进入密码页面: %s", loginStartPageType)
+		}
+
+		loginPasswordData, loginPasswordPageType, err := submitLoginPassword(httpClient, password)
+		if err != nil {
+			return nil, fmt.Errorf("重新登录提交密码失败: %w", err)
+		}
+		if nextURL := extractContinueURL(loginPasswordData); nextURL != "" {
+			status, _, getErr := httpClient.Get(nextURL)
+			if getErr != nil {
+				return nil, fmt.Errorf("访问重新登录验证码页失败: %w", getErr)
+			}
+			if status < 200 || status >= 400 {
+				return nil, fmt.Errorf("访问重新登录验证码页失败: %d", status)
+			}
+		}
+		if loginPasswordPageType != "email_otp_verification" {
+			return nil, fmt.Errorf("重新登录未进入验证码页面: %s", loginPasswordPageType)
+		}
+
+		otpSentAt = time.Now()
+		broadcast("  [8.1] 重新登录已进入邮箱验证码阶段", "dim")
+
+		reloginResendFn := func() bool {
+			s, _, _ := httpClient.PostJSON(OAIEmailOTPResendURL, map[string]interface{}{}, map[string]string{
+				"Referer": "https://auth.openai.com/email-verification",
+			})
+			return s >= 200 && s < 300
+		}
+
+		broadcast(fmt.Sprintf("    📧 等待重新登录验证码 (%s, %s)...", email, codeSource), "info")
+		if tempMail != nil {
+			code, err = waitForTempMailCode(email, otpSentAt, reloginResendFn, otpWaitRequireFreshCode)
+		} else if domainMail != nil {
+			code, err = waitForCode(email, otpSentAt, reloginResendFn, otpWaitRequireFreshCode)
+		} else {
+			code, err = fetchOutlookCode(acc, otpSentAt, reloginResendFn, otpWaitRequireFreshCode)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("重新登录获取验证码失败: %w", err)
+		}
+
+		broadcast(fmt.Sprintf("  [8.2] 验证重新登录 OTP: %s", code), "info")
+		vStatus, vBody, verifyErr := httpClient.PostJSON(OAIVerifyURL, map[string]interface{}{"code": code}, map[string]string{
+			"Referer": "https://auth.openai.com/email-verification",
+		})
+		if verifyErr != nil || vStatus < 200 || vStatus >= 300 {
+			return nil, fmt.Errorf("重新登录 OTP 验证失败: %d %s", vStatus, truncate(vBody, 300))
+		}
 	}
 
-	parts := strings.Split(authCookie, ".")
-	cookieB64 := parts[0]
-	for len(cookieB64)%4 != 0 {
-		cookieB64 += "="
-	}
-	cookieRaw, err := base64.StdEncoding.DecodeString(cookieB64)
+	workspaceID, cookieData, err := resolveWorkspaceID(httpClient.GetCookie("oai-client-auth-session"), workspaceSourceCreateData, workspaceSourcePostCreateData)
 	if err != nil {
-		return nil, fmt.Errorf("解析 cookie 失败: %w", err)
+		sourceKeys := formatWorkspaceSourceKeys(workspaceSourceCreateData, workspaceSourcePostCreateData)
+		if sourceKeys != "" {
+			return nil, fmt.Errorf("%w%s", err, sourceKeys)
+		}
+		return nil, err
 	}
-
-	var cookieData map[string]interface{}
-	json.Unmarshal(cookieRaw, &cookieData)
-	workspaces, _ := cookieData["workspaces"].([]interface{})
-	if len(workspaces) == 0 {
-		return nil, fmt.Errorf("未找到 workspace")
-	}
-	ws0, _ := workspaces[0].(map[string]interface{})
-	workspaceID, _ := ws0["id"].(string)
 	if workspaceID == "" {
-		return nil, fmt.Errorf("workspace_id 为空")
+		cookieKeys := strings.Join(sortedMapKeys(cookieData), ",")
+		sourceKeys := formatWorkspaceSourceKeys(workspaceSourceCreateData, workspaceSourcePostCreateData)
+		if sourceKeys != "" {
+			return nil, fmt.Errorf("未找到 workspace，cookie keys=%s%s", cookieKeys, sourceKeys)
+		}
+		return nil, fmt.Errorf("未找到 workspace，cookie keys=%s", cookieKeys)
 	}
 
 	broadcast(fmt.Sprintf("  [8] 选择 Workspace: %s...", workspaceID[:min(20, len(workspaceID))]), "info")
@@ -771,12 +1028,11 @@ func registerAccount(acc Account, proxy string, mode string, domainMail *DomainM
 	return result, nil
 }
 
-func waitForCode(email string, otpSentAt time.Time, resendFn func() bool) (string, error) {
+func waitForCode(email string, otpSentAt time.Time, resendFn func() bool, waitMode otpWaitMode) (string, error) {
 	// 清除旧验证码，避免二次注册时复用上一次的旧码
 	integratedIMAP.ConsumeCode(strings.ToLower(email), "")
 
-	// 将 otpSentAt 前 60 秒作为最早接受时间（留出时钟偏差容差，对应 Python min_ts = otp_sent_at - 60）
-	minTime := otpSentAt.Add(-60 * time.Second)
+	minTime := otpMinTime(otpSentAt, waitMode)
 
 	// 启动后台重发 goroutine
 	done := make(chan struct{})
@@ -827,7 +1083,7 @@ func waitForCode(email string, otpSentAt time.Time, resendFn func() bool) (strin
 // ═══════════════════════════════════════════════════════
 // Outlook 账号 IMAP 验证码获取
 // ═══════════════════════════════════════════════════════
-func fetchOutlookCode(acc Account, otpSentAt time.Time, resendFn func() bool) (string, error) {
+func fetchOutlookCode(acc Account, otpSentAt time.Time, resendFn func() bool, waitMode otpWaitMode) (string, error) {
 	const (
 		outlookHost    = "outlook.office365.com"
 		outlookPort    = 993
@@ -838,9 +1094,12 @@ func fetchOutlookCode(acc Account, otpSentAt time.Time, resendFn func() bool) (s
 
 	start := time.Now()
 	lastResend := time.Duration(0)
-	minTime := otpSentAt.Add(-60 * time.Second)
+	minTime := otpMinTime(otpSentAt, waitMode)
 
 	var c *imapclient.Client
+	var refreshErr error
+	var xoauthErr error
+	var passwordLoginErr error
 	connect := func() error {
 		if c != nil {
 			c.Logout()
@@ -858,20 +1117,27 @@ func fetchOutlookCode(acc Account, otpSentAt time.Time, resendFn func() bool) (s
 			if tokenErr == nil {
 				xoauth2 := buildXOAuth2(acc.Email, token)
 				if authErr := c.Authenticate(xoauth2Sasl(xoauth2)); authErr == nil {
+					refreshErr = nil
+					xoauthErr = nil
+					passwordLoginErr = nil
 					return nil
 				} else {
+					xoauthErr = authErr
 					broadcast(fmt.Sprintf("    ⚠️ XOAUTH2 失败: %v，尝试密码", authErr), "warning")
 				}
 			} else {
+				refreshErr = tokenErr
 				broadcast(fmt.Sprintf("    ⚠️ 刷新 MS Token 失败: %v，尝试密码", tokenErr), "warning")
 			}
 		}
 		// 回退密码认证
 		if loginErr := c.Login(acc.Email, acc.Password); loginErr != nil {
+			passwordLoginErr = loginErr
 			c.Logout()
 			c = nil
-			return fmt.Errorf("IMAP 登录失败: %w", loginErr)
+			return formatOutlookIMAPAuthError(refreshErr, xoauthErr, passwordLoginErr)
 		}
+		passwordLoginErr = nil
 		return nil
 	}
 
@@ -885,7 +1151,6 @@ func fetchOutlookCode(acc Account, otpSentAt time.Time, resendFn func() bool) (s
 	}()
 
 	seenCodes := map[string]bool{}
-	subjectRe := regexp.MustCompile(`\b(\d{6})\b`)
 
 	for time.Since(start) < PollTimeout {
 		if gStopFlag.Load() {
@@ -985,14 +1250,14 @@ func fetchOutlookCode(acc Account, otpSentAt time.Time, resendFn func() bool) (s
 
 			// 优先从 Subject 提取（对应 Python subj_match）
 			code := ""
-			if m := subjectRe.FindStringSubmatch(subject); len(m) >= 2 {
+			if m := emailCodeRe.FindStringSubmatch(subject); len(m) >= 2 {
 				code = m[1]
 			}
 			// Subject 无结果时，从正文精确匹配（对应 Python precise）
 			if code == "" {
 				if m := integratedBodyCodeRegex.FindStringSubmatch(bodyText); len(m) >= 2 {
 					code = m[1]
-				} else if m := subjectRe.FindStringSubmatch(bodyText); len(m) >= 2 {
+				} else if m := emailCodeRe.FindStringSubmatch(bodyText); len(m) >= 2 {
 					code = m[1]
 				}
 			}
@@ -1010,6 +1275,23 @@ func fetchOutlookCode(acc Account, otpSentAt time.Time, resendFn func() bool) (s
 
 	return "", fmt.Errorf("等待 Outlook 验证码超时")
 
+}
+
+func formatOutlookIMAPAuthError(refreshErr, xoauthErr, passwordLoginErr error) error {
+	parts := make([]string, 0, 3)
+	if refreshErr != nil {
+		parts = append(parts, fmt.Sprintf("刷新 MS Token 失败: %v", refreshErr))
+	}
+	if xoauthErr != nil {
+		parts = append(parts, fmt.Sprintf("XOAUTH2 认证失败: %v", xoauthErr))
+	}
+	if passwordLoginErr != nil {
+		parts = append(parts, fmt.Sprintf("密码 LOGIN 失败: %v", passwordLoginErr))
+	}
+	if len(parts) == 0 {
+		return fmt.Errorf("Outlook IMAP 认证失败")
+	}
+	return fmt.Errorf("Outlook IMAP 认证失败: %s", strings.Join(parts, "; "))
 }
 
 // refreshMSToken 刷新 Microsoft access token（对应 Python refresh_ms_token）
@@ -1067,12 +1349,19 @@ func (x *xoauth2Client) Next(challenge []byte) ([]byte, error) {
 func main() {
 	exe, _ := os.Executable()
 	exeDir := filepath.Dir(exe)
+	runtimeDir = exeDir
 	resultsDir = filepath.Join(exeDir, "tokens")
 
 	// 如果在开发模式，用当前目录
 	if _, err := os.Stat(filepath.Join(".", "web_ui.html")); err == nil {
 		exeDir = "."
+		runtimeDir = "."
 		resultsDir = filepath.Join(".", "tokens")
+	}
+	if err := initBlockedTempMailDomainsDB(runtimeDir); err != nil {
+		log.Printf("[warning] %s", localizeRuntimeText(activeLanguage(), fmt.Sprintf("初始化临时邮箱域名数据库失败: %v", err)))
+	} else {
+		defer closeBlockedTempMailDomainsDB()
 	}
 
 	mux := http.NewServeMux()
@@ -1102,12 +1391,12 @@ func main() {
 	addr := ":8899"
 	fmt.Printf(`
 ╔══════════════════════════════════════════════╗
-║  OpenAI 协议注册 (Go 高速版)                 ║
+║  OpenAI API Registration (Go Fast Mode)     ║
 ║                                              ║
 ║  🌐 http://localhost%s                    ║
-║  📁 结果目录: %s
+║  📁 Results directory: %s
 ║                                              ║
-║  按 Ctrl+C 退出                              ║
+║  Press Ctrl+C to exit                        ║
 ╚══════════════════════════════════════════════╝
 `, addr, resultsDir)
 
@@ -1127,18 +1416,36 @@ func normalizeTempWorkers(requested int, allowParallel bool) int {
 	return requested
 }
 
-func isPasswordlessUnavailable(status int, body string) bool {
-	lower := strings.ToLower(body)
-	return status == 401 && strings.Contains(lower, "passwordless signup is unavailable")
+func extractPageType(data map[string]interface{}) string {
+	return extractPageTypeDetailed(data, "", "")
 }
 
-func extractPageType(data map[string]interface{}) string {
-	page, ok := data["page"].(map[string]interface{})
-	if !ok {
-		return ""
+func extractPageTypeDetailed(data map[string]interface{}, responseURL, bodyText string) string {
+	if page, ok := data["page"].(map[string]interface{}); ok {
+		if pageType := strings.TrimSpace(strFromMap(page, "type")); pageType != "" {
+			return pageType
+		}
+		if pageType := strings.TrimSpace(strFromMap(page, "page_type")); pageType != "" {
+			return pageType
+		}
 	}
-	pageType, _ := page["type"].(string)
-	return pageType
+	if pageType := strings.TrimSpace(strFromMap(data, "page_type")); pageType != "" {
+		return pageType
+	}
+	if pageType := strings.TrimSpace(strFromMap(data, "type")); pageType != "" {
+		return pageType
+	}
+
+	loweredURL := strings.ToLower(responseURL)
+	loweredBody := strings.ToLower(bodyText)
+	if strings.Contains(loweredURL, "add-phone") {
+		return "add_phone"
+	}
+	if strings.Contains(loweredBody, "registration_disallowed") ||
+		strings.Contains(loweredBody, "cannot create your account with the given information") {
+		return "registration_disallowed"
+	}
+	return ""
 }
 
 func normalizeRegisterPassword(raw string) (string, error) {
@@ -1153,18 +1460,124 @@ func normalizeRegisterPassword(raw string) (string, error) {
 	return password, nil
 }
 
+func normalizeOutlookRegisterPassword(raw string) string {
+	password := strings.TrimSpace(raw)
+	switch password {
+	case "", "Qwer1234!":
+		return defaultRegisterPassword
+	}
+	if len([]rune(password)) < 12 {
+		return defaultRegisterPassword
+	}
+	return password
+}
+
+func resolveRegisterPassword(acc Account, domainMail *DomainMailConfig, tempMail *TempMailConfig) (string, error) {
+	registerSource := firstNonEmpty(acc.RegisterPassword, acc.Password)
+	if domainMail == nil && tempMail == nil {
+		return normalizeOutlookRegisterPassword(registerSource), nil
+	}
+	return normalizeRegisterPassword(registerSource)
+}
+
+func parseAccountLine(line string, fallbackRegisterPassword string) (Account, bool) {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return Account{}, false
+	}
+	parts := strings.Split(line, "----")
+	if len(parts) < 2 {
+		return Account{}, false
+	}
+
+	acc := Account{
+		Email:            strings.TrimSpace(parts[0]),
+		Password:         strings.TrimSpace(parts[1]),
+		RegisterPassword: strings.TrimSpace(fallbackRegisterPassword),
+	}
+	if len(parts) > 2 {
+		acc.ClientID = strings.TrimSpace(parts[2])
+	}
+	if len(parts) > 3 {
+		acc.RefreshToken = strings.TrimSpace(parts[3])
+	}
+	if len(parts) > 4 {
+		acc.RegisterPassword = strings.TrimSpace(parts[4])
+	}
+	if acc.Email == "" || acc.Password == "" {
+		return Account{}, false
+	}
+	return acc, true
+}
+
+func shouldRotateTempMailboxOnRetry(attempt int, tempMail *TempMailConfig, errMsg string) bool {
+	if tempMail == nil || attempt >= MaxRetry {
+		return false
+	}
+
+	lower := strings.ToLower(strings.TrimSpace(errMsg))
+	if lower == "" {
+		return false
+	}
+
+	switch {
+	case strings.Contains(lower, "创建账号失败"),
+		strings.Contains(lower, "cannot create your account with the given information"),
+		strings.Contains(lower, "registration_disallowed"),
+		strings.Contains(lower, "add_phone"),
+		strings.Contains(lower, "提交注册密码失败"),
+		strings.Contains(lower, "failed to register username"),
+		strings.Contains(lower, "already exists"),
+		strings.Contains(lower, "otp 验证失败"),
+		strings.Contains(lower, "incorrect code"):
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldRejectTempMailDomain(errMsg string) bool {
+	lower := strings.ToLower(strings.TrimSpace(errMsg))
+	if lower == "" {
+		return false
+	}
+
+	switch {
+	case strings.Contains(lower, "创建账号失败"),
+		strings.Contains(lower, "cannot create your account with the given information"),
+		strings.Contains(lower, "registration_disallowed"):
+		return true
+	default:
+		return false
+	}
+}
+
 func handleStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", 405)
 		return
 	}
+
+	var req StartRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	setActiveLanguage(req.Language)
 	if gRunning.Load() {
 		jsonResp(w, map[string]interface{}{"error": "已有任务运行中"})
 		return
 	}
 
-	var req StartRequest
-	json.NewDecoder(r.Body).Decode(&req)
+	if strings.TrimSpace(req.OutlookRegisterPassword) != "" {
+		if req.DomainMail == nil && req.TempMail == nil {
+			req.OutlookRegisterPassword = normalizeOutlookRegisterPassword(req.OutlookRegisterPassword)
+		} else {
+			password, err := normalizeRegisterPassword(req.OutlookRegisterPassword)
+			if err != nil {
+				jsonResp(w, map[string]interface{}{"error": err.Error()})
+				return
+			}
+			req.OutlookRegisterPassword = password
+		}
+	}
 
 	// 自动配置集成 IMAP 服务
 	if req.DomainMail != nil && req.DomainMail.Host != "" {
@@ -1186,6 +1599,9 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 
 	var accounts []Account
 	isTempMode := req.TempMail != nil && req.TempMail.Count > 0
+	if req.OutlookRegisterPassword == "" && !isTempMode && req.DomainMail == nil {
+		req.OutlookRegisterPassword = defaultRegisterPassword
+	}
 
 	if isTempMode {
 		configureTempMailRuntime(req.Proxy, req.TempMail)
@@ -1212,12 +1628,12 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 		if req.TempMail.AllowParallel {
-			broadcast(fmt.Sprintf("🧪 Temp Mail 模式已启用: %d 个账号，并发 %d，切换延迟 %d 秒（平行开关: ON）", count, req.Workers, req.TempMail.PostSuccessDelaySeconds()), "info")
+			broadcast(fmt.Sprintf("🧪 Temp Mail 模式已启用: %d 个账号，provider=tempmail.lol，并发 %d，切换延迟 %d 秒（平行开关: ON）", count, req.Workers, req.TempMail.PostSuccessDelaySeconds()), "info")
 			if req.Workers > 5 {
 				broadcast("⚠️ Temp Mail 并发过高更容易触发限流，建议控制在 2-5", "warning")
 			}
 		} else {
-			broadcast(fmt.Sprintf("🧪 Temp Mail 模式已启用: %d 个账号，固定并发 1，切换延迟 %d 秒（平行开关: OFF）", count, req.TempMail.PostSuccessDelaySeconds()), "info")
+			broadcast(fmt.Sprintf("🧪 Temp Mail 模式已启用: %d 个账号，provider=tempmail.lol，固定并发 1，切换延迟 %d 秒（平行开关: OFF）", count, req.TempMail.PostSuccessDelaySeconds()), "info")
 		}
 		if count > 1 && !req.TempMail.AllowParallel {
 			broadcast("⚠️ Temp Mail 会限制短时间创建新邮箱，建议先用 1 个账号验证链路", "warning")
@@ -1225,20 +1641,13 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// 解析账号
 		for _, line := range strings.Split(req.Accounts, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") {
+			fallbackRegisterPassword := ""
+			if req.DomainMail == nil {
+				fallbackRegisterPassword = req.OutlookRegisterPassword
+			}
+			acc, ok := parseAccountLine(line, fallbackRegisterPassword)
+			if !ok {
 				continue
-			}
-			parts := strings.Split(line, "----")
-			if len(parts) < 2 {
-				continue
-			}
-			acc := Account{Email: parts[0], Password: parts[1]}
-			if len(parts) > 2 {
-				acc.ClientID = parts[2]
-			}
-			if len(parts) > 3 {
-				acc.RefreshToken = parts[3]
 			}
 			accounts = append(accounts, acc)
 		}
@@ -1253,12 +1662,12 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if allPlaceholder {
-			password, err := normalizeRegisterPassword(accounts[0].Password)
+			password, err := resolveRegisterPassword(accounts[0], req.DomainMail, req.TempMail)
 			if err != nil {
 				jsonResp(w, map[string]interface{}{"error": err.Error()})
 				return
 			}
-			if strings.TrimSpace(accounts[0].Password) != password {
+			if strings.TrimSpace(firstNonEmpty(accounts[0].RegisterPassword, accounts[0].Password)) != password {
 				broadcast(fmt.Sprintf("⚠️ 占位账号密码已自动升级为兼容默认值: %s", password), "warning")
 			}
 			req.TempMail = &TempMailConfig{
@@ -1270,9 +1679,9 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 			req.Workers = normalizeTempWorkers(req.Workers, req.TempMail.AllowParallel)
 			configureTempMailRuntime(req.Proxy, req.TempMail)
 			if req.TempMail.AllowParallel {
-				broadcast(fmt.Sprintf("🧪 自动识别 Temp Mail 占位账号: %d 个，并发 %d，切换延迟 %d 秒（平行开关: ON）", len(accounts), req.Workers, req.TempMail.PostSuccessDelaySeconds()), "warning")
+				broadcast(fmt.Sprintf("🧪 自动识别 Temp Mail 占位账号: %d 个，provider=tempmail.lol，并发 %d，切换延迟 %d 秒（平行开关: ON）", len(accounts), req.Workers, req.TempMail.PostSuccessDelaySeconds()), "warning")
 			} else {
-				broadcast(fmt.Sprintf("🧪 自动识别 Temp Mail 占位账号: %d 个，固定并发 1，切换延迟 %d 秒（平行开关: OFF）", len(accounts), req.TempMail.PostSuccessDelaySeconds()), "warning")
+				broadcast(fmt.Sprintf("🧪 自动识别 Temp Mail 占位账号: %d 个，provider=tempmail.lol，固定并发 1，切换延迟 %d 秒（平行开关: OFF）", len(accounts), req.TempMail.PostSuccessDelaySeconds()), "warning")
 			}
 		}
 	}
@@ -1299,10 +1708,7 @@ func handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mode := "register"
-	if req.LoginMode {
-		mode = "login"
-	}
+	mode := "login"
 
 	// 重置状态
 	gRunning.Store(true)
@@ -1339,7 +1745,7 @@ func handleStatusAPI(w http.ResponseWriter, r *http.Request) {
 func handleSSE(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "SSE not supported", 500)
+		http.Error(w, localizeRuntimeText(activeLanguage(), "SSE not supported"), 500)
 		return
 	}
 
@@ -1424,19 +1830,21 @@ func doOne(acc Account, idx, total int, proxy, mode string, domainMail *DomainMa
 	var lastErr string
 	finalEmail := acc.Email
 	assignedMailbox := ""
+	needFreshTempMailbox := tempMail != nil
 
-	if tempMail != nil {
+	assignTempMailbox := func() bool {
 		const maxMailboxAllocAttempts = 2
+		assignedMailbox = ""
 		for allocAttempt := 1; allocAttempt <= maxMailboxAllocAttempts; allocAttempt++ {
 			if gStopFlag.Load() {
-				return
+				return false
 			}
 			mailbox, mailboxErr := acquireTempMailbox()
 			if mailboxErr == nil {
 				assignedMailbox = mailbox
 				finalEmail = mailbox
 				broadcast(fmt.Sprintf("  🧪 Temp Mail 分配邮箱: %s", mailbox), "info")
-				break
+				return true
 			}
 			lastErr = fmt.Sprintf("Temp Mail 获取邮箱失败: %v", mailboxErr)
 			broadcast(fmt.Sprintf("  ❌ 分配邮箱失败 #%d: %s", allocAttempt, truncate(lastErr, 120)), "error")
@@ -1444,21 +1852,21 @@ func doOne(acc Account, idx, total int, proxy, mode string, domainMail *DomainMa
 				time.Sleep(time.Duration(allocAttempt*3) * time.Second)
 			}
 		}
-		if assignedMailbox == "" {
-			manualMailbox, manualErr := waitManualMailboxInput(3 * time.Minute)
-			if manualErr != nil {
-				lastErr = fmt.Sprintf("%s; %v", truncate(lastErr, 80), manualErr)
-				gFail.Add(1)
-				broadcastJSON(map[string]interface{}{
-					"type": "result", "email": finalEmail, "success": false,
-					"elapsed": "—", "error": truncate(lastErr, 100),
-				})
-				return
-			}
-			assignedMailbox = manualMailbox
-			finalEmail = manualMailbox
-			broadcast(fmt.Sprintf("  🧪 使用手动输入临时邮箱: %s", manualMailbox), "info")
+
+		manualMailbox, manualErr := waitManualMailboxInput(3 * time.Minute)
+		if manualErr != nil {
+			lastErr = fmt.Sprintf("%s; %v", truncate(lastErr, 80), manualErr)
+			gFail.Add(1)
+			broadcastJSON(map[string]interface{}{
+				"type": "result", "email": finalEmail, "success": false,
+				"elapsed": "—", "error": truncate(lastErr, 100),
+			})
+			return false
 		}
+		assignedMailbox = manualMailbox
+		finalEmail = manualMailbox
+		broadcast(fmt.Sprintf("  🧪 使用手动输入临时邮箱: %s", manualMailbox), "info")
+		return true
 	}
 
 	for attempt := 1; attempt <= MaxRetry; attempt++ {
@@ -1467,7 +1875,14 @@ func doOne(acc Account, idx, total int, proxy, mode string, domainMail *DomainMa
 		}
 		if attempt > 1 {
 			broadcast(fmt.Sprintf("  重试 #%d...", attempt), "warning")
-			sleepFlow(tempMail != nil, 2000, 4000)
+			sleepFlow(tempMail != nil, 1000, 1800)
+		}
+
+		if tempMail != nil && needFreshTempMailbox {
+			if !assignTempMailbox() {
+				return
+			}
+			needFreshTempMailbox = false
 		}
 
 		runAcc := acc
@@ -1482,6 +1897,15 @@ func doOne(acc Account, idx, total int, proxy, mode string, domainMail *DomainMa
 			}
 			lastErr = err.Error()
 			broadcast(fmt.Sprintf("  ❌ 尝试 %d 失败: %s", attempt, truncate(lastErr, 120)), "error")
+			if tempMail != nil && assignedMailbox != "" && shouldRejectTempMailDomain(lastErr) {
+				if blockedDomain := rejectTempMailMailbox(assignedMailbox, lastErr); blockedDomain != "" {
+					broadcast(fmt.Sprintf("  🚫 临时邮箱域名已写入本地数据库并标记为不可用: %s", blockedDomain), "warning")
+				}
+			}
+			if shouldRotateTempMailboxOnRetry(attempt, tempMail, lastErr) {
+				needFreshTempMailbox = true
+				broadcast("  🔁 Temp Mail 下一次重试将自动更换新邮箱，避免复用已失效地址", "warning")
+			}
 			continue
 		}
 
@@ -1515,7 +1939,7 @@ func doOne(acc Account, idx, total int, proxy, mode string, domainMail *DomainMa
 		gFail.Add(1)
 		broadcastJSON(map[string]interface{}{
 			"type": "result", "email": finalEmail, "success": false,
-			"elapsed": "—", "error": truncate(lastErr, 100),
+			"elapsed": "—", "error": localizeRuntimeText(activeLanguage(), truncate(lastErr, 100)),
 		})
 	}
 }
@@ -1524,6 +1948,7 @@ func doOne(acc Account, idx, total int, proxy, mode string, domainMail *DomainMa
 // 工具函数
 // ═══════════════════════════════════════════════════════
 func broadcast(msg, level string) {
+	msg = localizeRuntimeText(activeLanguage(), msg)
 	data, _ := json.Marshal(map[string]interface{}{
 		"type": "log", "text": fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), msg), "level": level,
 	})
@@ -1539,7 +1964,7 @@ func broadcast(msg, level string) {
 }
 
 func broadcastJSON(v interface{}) {
-	data, _ := json.Marshal(v)
+	data, _ := json.Marshal(localizePayload(v))
 	sseClientsLock.Lock()
 	for ch := range sseClients {
 		select {
@@ -1552,7 +1977,7 @@ func broadcastJSON(v interface{}) {
 
 func jsonResp(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(localizePayload(v))
 }
 
 func getFinishedEmails() map[string]bool {
@@ -1663,4 +2088,222 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+func decodeSessionCookiePayload(segment string) ([]byte, error) {
+	segment = strings.TrimSpace(segment)
+	if segment == "" {
+		return nil, fmt.Errorf("empty cookie payload")
+	}
+
+	padded := segment
+	for len(padded)%4 != 0 {
+		padded += "="
+	}
+
+	decoders := []struct {
+		name string
+		enc  *base64.Encoding
+		src  string
+	}{
+		{name: "raw-url", enc: base64.RawURLEncoding, src: segment},
+		{name: "url", enc: base64.URLEncoding, src: padded},
+		{name: "raw-std", enc: base64.RawStdEncoding, src: segment},
+		{name: "std", enc: base64.StdEncoding, src: padded},
+	}
+
+	var lastErr error
+	for _, decoder := range decoders {
+		raw, err := decoder.enc.DecodeString(decoder.src)
+		if err == nil {
+			return raw, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no base64 decoder matched")
+	}
+	return nil, lastErr
+}
+
+func extractContinueURL(data map[string]interface{}) string {
+	if data == nil {
+		return ""
+	}
+
+	for _, key := range []string{"continue_url", "continueUrl", "redirect_url", "redirectUrl"} {
+		if value := strFromMap(data, key); value != "" {
+			return value
+		}
+	}
+
+	for _, key := range []string{"page", "session", "data", "result"} {
+		if nested, ok := data[key].(map[string]interface{}); ok {
+			if value := extractContinueURL(nested); value != "" {
+				return value
+			}
+		}
+	}
+
+	return ""
+}
+
+func decodeJSONMapBody(body string) map[string]interface{} {
+	body = strings.TrimSpace(body)
+	if body == "" || !strings.HasPrefix(body, "{") {
+		return nil
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &data); err != nil {
+		return nil
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	return data
+}
+
+func formatWorkspaceSourceKeys(createAccountData, postCreateContinueData map[string]interface{}) string {
+	parts := []string{}
+	if createKeys := strings.Join(sortedMapKeys(createAccountData), ","); createKeys != "" {
+		parts = append(parts, "create_account keys="+createKeys)
+	}
+	if continueKeys := strings.Join(sortedMapKeys(postCreateContinueData), ","); continueKeys != "" {
+		parts = append(parts, "post_create_continue keys="+continueKeys)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "; " + strings.Join(parts, "; ")
+}
+
+type workspacePageContext struct {
+	Data        map[string]interface{}
+	ResponseURL string
+	BodyText    string
+}
+
+func extractWorkspaceBlockerPageType(sources ...map[string]interface{}) string {
+	contexts := make([]workspacePageContext, 0, len(sources))
+	for _, source := range sources {
+		contexts = append(contexts, workspacePageContext{Data: source})
+	}
+	return extractWorkspaceBlockerPageTypeWithContext(contexts...)
+}
+
+func extractWorkspaceBlockerPageTypeWithContext(sources ...workspacePageContext) string {
+	for _, source := range sources {
+		switch extractPageTypeDetailed(source.Data, source.ResponseURL, source.BodyText) {
+		case "add_phone":
+			return "add_phone"
+		case "registration_disallowed":
+			return "registration_disallowed"
+		}
+	}
+	return ""
+}
+
+func decodeWorkspaceCookieData(authCookie string) (map[string]interface{}, error) {
+	authCookie = strings.TrimSpace(authCookie)
+	if authCookie == "" {
+		return nil, fmt.Errorf("未获取到 oai-client-auth-session cookie")
+	}
+
+	parts := strings.Split(authCookie, ".")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return nil, fmt.Errorf("oai-client-auth-session cookie 格式异常")
+	}
+
+	cookieRaw, err := decodeSessionCookiePayload(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("解析 cookie 失败: %w", err)
+	}
+
+	var cookieData map[string]interface{}
+	if err := json.Unmarshal(cookieRaw, &cookieData); err != nil {
+		return nil, fmt.Errorf("解析 cookie JSON 失败: %w", err)
+	}
+	return cookieData, nil
+}
+
+func resolveWorkspaceID(authCookie string, sources ...map[string]interface{}) (string, map[string]interface{}, error) {
+	for _, source := range sources {
+		if workspaceID := extractWorkspaceID(source); workspaceID != "" {
+			return workspaceID, nil, nil
+		}
+	}
+
+	cookieData, err := decodeWorkspaceCookieData(authCookie)
+	if err != nil {
+		return "", nil, err
+	}
+
+	workspaceID := extractWorkspaceID(cookieData)
+	return workspaceID, cookieData, nil
+}
+
+func extractWorkspaceID(data map[string]interface{}) string {
+	if data == nil {
+		return ""
+	}
+
+	for _, key := range []string{"workspace_id", "default_workspace_id", "selected_workspace_id"} {
+		if value := strFromMap(data, key); value != "" {
+			return value
+		}
+	}
+
+	for _, key := range []string{"workspace", "default_workspace", "selected_workspace"} {
+		if nested, ok := data[key].(map[string]interface{}); ok {
+			if value := extractWorkspaceObjectID(nested); value != "" {
+				return value
+			}
+		}
+	}
+
+	if workspaces, ok := data["workspaces"].([]interface{}); ok {
+		for _, item := range workspaces {
+			if ws, ok := item.(map[string]interface{}); ok {
+				if value := extractWorkspaceObjectID(ws); value != "" {
+					return value
+				}
+			}
+		}
+	}
+
+	for _, outerKey := range []string{"session", "user", "organization"} {
+		if nested, ok := data[outerKey].(map[string]interface{}); ok {
+			if value := extractWorkspaceID(nested); value != "" {
+				return value
+			}
+		}
+	}
+
+	return ""
+}
+
+func extractWorkspaceObjectID(data map[string]interface{}) string {
+	if data == nil {
+		return ""
+	}
+	if value := strFromMap(data, "id"); value != "" {
+		return value
+	}
+	if value := extractWorkspaceID(data); value != "" {
+		return value
+	}
+	return ""
+}
+
+func sortedMapKeys(data map[string]interface{}) []string {
+	if len(data) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(data))
+	for key := range data {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }

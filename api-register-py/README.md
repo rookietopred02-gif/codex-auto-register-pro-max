@@ -49,7 +49,7 @@ pip install -r requirements.txt
 |------|------|
 | 并发数 | 并发线程数，建议 3~10 |
 | 代理 | HTTP 代理，如 `http://127.0.0.1:7890` |
-| 注册转登录 | 已注册账号走登录流程刷新 Token |
+| 注册后自动重登 | `create_account` 成功后自动进入 `login -> password -> OTP -> token/workspace`，界面不再提供额外开关 |
 | 域名邮箱 | 配置 catch-all IMAP 收件箱 |
 
 ## 与 Go 版的区别

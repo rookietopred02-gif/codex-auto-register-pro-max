@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>OpenAI 协议注册 — 控制台</title>
+  <title>OpenAI API Registration Console</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link
     href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
@@ -601,38 +601,51 @@
   <div class="app">
     <!-- 头部 -->
     <div class="header fade-in">
-      <h1>⚡ OpenAI 协议注册</h1>
-      <p>纯 API 批量注册 · 浏览器指纹伪装 · IMAP 自动验证</p>
+      <div style="display:flex; justify-content:flex-end; align-items:center; gap:10px; margin-bottom:12px;">
+        <label for="languageSelect" id="languageLabel" style="font-size:0.8rem; color:var(--text-secondary);">Language</label>
+        <select id="languageSelect" style="width:auto; min-width:150px; background:var(--bg-secondary); border:1px solid var(--border); border-radius:8px; padding:8px 12px; color:var(--text-primary);">
+          <option value="en">English</option>
+          <option value="zh-TW">繁體中文</option>
+        </select>
+      </div>
+      <h1>⚡ OpenAI API Registration</h1>
+      <p>Pure API batch registration · Browser fingerprint spoofing · IMAP auto verification</p>
     </div>
 
     <!-- 配置 + 统计 -->
     <div class="grid-2 fade-in">
       <!-- 左：配置 -->
       <div class="card">
-        <div class="card-title"><span class="icon">⚙️</span> 注册配置</div>
+        <div class="card-title"><span class="icon">⚙️</span> Registration Settings</div>
         <!-- 邮箱模式选择 -->
         <div style="display:flex; gap:8px; margin-bottom:16px;">
           <button class="btn btn-primary" id="btnModeOutlook" onclick="setMailMode('outlook')"
             style="flex:1; padding:8px 12px; font-size:0.85rem;">
-            📮 Outlook 账号模式
+            📮 Outlook Account Mode
           </button>
           <button class="btn btn-outline" id="btnModeDomain" onclick="setMailMode('domain')"
             style="flex:1; padding:8px 12px; font-size:0.85rem;">
-            🌐 域名邮箱模式
+            🌐 Custom Domain Mail Mode
           </button>
           <button class="btn btn-outline" id="btnModeTemp" onclick="setMailMode('temp')"
             style="flex:1; padding:8px 12px; font-size:0.85rem;">
-            🧪 Temp Mail 模式
+            🧪 Temp Mail Mode
           </button>
         </div>
 
         <!-- Outlook 模式：账号列表 -->
         <div id="panelOutlook">
           <div class="form-group">
-            <label>账号列表</label>
+            <label>OpenAI Registration Password</label>
+            <input type="text" id="outlookRegisterPassword" value="Qwer1234!Aa#"
+              placeholder="Default OpenAI registration password for Outlook mode">
+            <div class="hint">The account list still uses mailbox passwords. To override one line, use column 5: email----mail_password----client_id----refresh_token----openai_password</div>
+          </div>
+          <div class="form-group">
+            <label>Account List</label>
             <textarea id="accounts"
-              placeholder="每行一个，格式: 邮箱----密码----client_id----refresh_token&#10;例如:&#10;user@outlook.com----password123----client_id----refresh_token"></textarea>
-            <div class="hint">支持从 accounts.txt 粘贴，每行一个账号</div>
+              placeholder="One per line: email----mail_password----client_id----refresh_token----OpenAI_password(optional)&#10;Example:&#10;user@outlook.com----mail_password----client_id----refresh_token----Qwer1234!Aa#"></textarea>
+            <div class="hint">You can paste from accounts.txt. Column 5 is optional; when omitted, the OpenAI password above will be used.</div>
           </div>
         </div>
 
@@ -640,58 +653,58 @@
         <div id="panelDomain" style="display:none;">
           <div
             style="padding:12px; background:rgba(99,102,241,0.06); border:1px solid var(--border); border-radius:8px; margin-bottom:12px;">
-            <div style="font-size:0.82rem; color:var(--text-secondary); margin-bottom:8px;">📮 域名邮箱 IMAP 配置</div>
+            <div style="font-size:0.82rem; color:var(--text-secondary); margin-bottom:8px;">📮 Domain Mail IMAP Configuration</div>
             <div class="grid-2">
               <div class="form-group">
-                <label>IMAP 服务器</label>
+                <label>IMAP Server</label>
                 <input type="text" id="domainImapHost" placeholder="imap.example.com">
               </div>
               <div class="form-group">
-                <label>IMAP 端口</label>
+                <label>IMAP Port</label>
                 <input type="number" id="domainImapPort" value="993" min="1" max="65535">
               </div>
             </div>
             <div class="grid-2">
               <div class="form-group">
-                <label>IMAP 账号</label>
+                <label>IMAP Username</label>
                 <input type="text" id="domainImapUser" placeholder="admin@example.com">
               </div>
               <div class="form-group">
-                <label>IMAP 密码</label>
-                <input type="password" id="domainImapPass" placeholder="IMAP 密码/应用专用密码">
+                <label>IMAP Password</label>
+                <input type="password" id="domainImapPass" placeholder="IMAP password / app password">
               </div>
             </div>
           </div>
           <div
             style="padding:12px; background:rgba(34,197,94,0.06); border:1px solid var(--border); border-radius:8px;">
-            <div style="font-size:0.82rem; color:var(--text-secondary); margin-bottom:8px;">📧 注册邮箱设置</div>
+            <div style="font-size:0.82rem; color:var(--text-secondary); margin-bottom:8px;">📧 Registration Mail Settings</div>
             <div class="grid-2">
               <div class="form-group">
-                <label>域名</label>
+                <label>Domain</label>
                 <input type="text" id="domainName" placeholder="example.com">
               </div>
               <div class="form-group">
-                <label>邮箱前缀</label>
+                <label>Mailbox Prefix</label>
                 <input type="text" id="domainPrefix" placeholder="auto" value="auto">
               </div>
             </div>
             <div class="grid-2">
               <div class="form-group">
-                <label>注册数量</label>
+                <label>Registration Count</label>
                 <input type="number" id="domainCount" value="10" min="1" max="1000">
               </div>
               <div class="form-group">
-                <label>OpenAI 密码</label>
-                <input type="text" id="domainPassword" placeholder="统一密码" value="Qwer1234!Aa#">
+                <label>OpenAI Password</label>
+                <input type="text" id="domainPassword" placeholder="Shared password" value="Qwer1234!Aa#">
               </div>
             </div>
-            <div class="hint">将自动生成 前缀+随机数@域名 的邮箱地址进行批量注册</div>
+            <div class="hint">The system will generate prefix+random@domain mailboxes automatically for batch registration.</div>
             <div style="margin-top:10px;">
               <button onclick="cleanupEmails()"
                 style="padding:6px 16px; font-size:0.8rem; background:rgba(239,68,68,0.12); color:#ef4444; border:1px solid rgba(239,68,68,0.3); border-radius:6px; cursor:pointer; transition:all 0.2s;"
                 onmouseover="this.style.background='rgba(239,68,68,0.28)'"
                 onmouseout="this.style.background='rgba(239,68,68,0.12)'">
-                🧹 清理域名邮箱中的 OpenAI 邮件
+                🧹 Clean OpenAI mail from domain inbox
               </button>
             </div>
           </div>
@@ -701,77 +714,80 @@
         <div id="panelTemp" style="display:none;">
           <div
             style="padding:12px; background:rgba(14,165,233,0.06); border:1px solid var(--border); border-radius:8px;">
-            <div style="font-size:0.82rem; color:var(--text-secondary); margin-bottom:8px;">🧪 Temp Mail 配置（temp-mail.org）</div>
+            <div style="font-size:0.82rem; color:var(--text-secondary); margin-bottom:8px;">🧪 Temp Mail Configuration (tempmail.lol)</div>
             <div class="grid-2">
               <div class="form-group">
-                <label>注册数量</label>
+                <label>Registration Count</label>
                 <input type="number" id="tempMailCount" value="3" min="1" max="100">
               </div>
               <div class="form-group">
-                <label>OpenAI 密码</label>
+                <label>OpenAI Password</label>
                 <input type="text" id="tempMailPassword" value="Qwer1234!Aa#">
               </div>
             </div>
             <div class="grid-2">
               <div class="form-group">
-                <label>切换下一个前延迟（秒）</label>
+                <label>Delay Before Next Account (seconds)</label>
                 <input type="number" id="tempMailNextDelay" value="15" min="0" max="300">
               </div>
               <div class="form-group">
-                <label>说明</label>
-                <input type="text" value="拿到前一个 Token 后等待再切到下一个" readonly>
+                <label>Description</label>
+                <input type="text" value="Wait after the previous token is acquired, then switch to the next account" readonly>
+              </div>
+            </div>
+            <div class="grid-2">
+              <div class="form-group" id="tempMailApiBaseGroup">
+                <label>Tempmail API Base URL</label>
+                <input type="text" id="tempMailApiBaseURL" value="https://api.tempmail.lol/v2" placeholder="https://api.tempmail.lol/v2">
+                <div class="hint">Default is tempmail.lol. You can switch to another compatible API endpoint.</div>
               </div>
             </div>
             <div class="switch-row" style="margin-top:8px;">
               <label class="switch"><input type="checkbox" id="tempMailParallel"><span class="slider"></span></label>
-              <label for="tempMailParallel">⚡ 启用 Temp Mail 平行注册（使用全局并发线程数）</label>
+              <label for="tempMailParallel">⚡ Enable Temp Mail parallel registration (uses global worker count)</label>
             </div>
-            <div class="hint">默认延迟 15 秒。设为 0 表示成功拿到 Token 后立即切换。平行开启后，这个延迟按每个工作线程分别生效。</div>
+            <div class="hint">Default delay is 15 seconds. Set to 0 to switch immediately after a token is acquired. In parallel mode, the delay applies per worker.</div>
           </div>
         </div>
 
         <div class="grid-2">
           <div class="form-group">
-            <label>代理地址</label>
-            <input type="text" id="proxy" placeholder="http://ip:port（可选）">
+            <label>Proxy</label>
+            <input type="text" id="proxy" placeholder="http://ip:port (optional)">
           </div>
           <div class="form-group">
-            <label>并发线程数</label>
+            <label>Worker Count</label>
             <input type="number" id="workers" value="1" min="1" max="50">
           </div>
         </div>
         <div class="btn-group">
-          <button class="btn btn-primary" id="btnStart" onclick="startRegister()">🚀 开始注册</button>
-          <button class="btn btn-danger" id="btnStop" onclick="stopRegister()" style="display:none">⏹ 停止</button>
-          <button class="btn btn-outline" id="btnRetry" onclick="retryFailed()" style="display:none">🔁 重试失败账号</button>
-          <button class="btn btn-outline" id="btnLoadFile" onclick="loadAccountsFile()">📂 载入文件</button>
-        </div>
-        <div class="switch-row">
-          <label class="switch"><input type="checkbox" id="loginMode"><span class="slider"></span></label>
-          <label for="loginMode">🔄 注册转登录模式（用登录流程获取 Token）</label>
+          <button class="btn btn-primary" id="btnStart" onclick="startRegister()">🚀 Start Registration</button>
+          <button class="btn btn-danger" id="btnStop" onclick="stopRegister()" style="display:none">⏹ Stop</button>
+          <button class="btn btn-outline" id="btnRetry" onclick="retryFailed()" style="display:none">🔁 Retry Failed Accounts</button>
+          <button class="btn btn-outline" id="btnLoadFile" onclick="loadAccountsFile()">📂 Load File</button>
         </div>
         <div class="switch-row">
           <label class="switch"><input type="checkbox" id="skipFinished" checked><span class="slider"></span></label>
-          <label for="skipFinished">⏭️ 跳过已有凭证账户（results 目录已存在结果的账号）</label>
+          <label for="skipFinished">⏭️ Skip accounts that already have saved credentials (existing files in results/tokens)</label>
         </div>
         <div id="toastArea" style="margin-top:12px"></div>
       </div>
 
       <!-- 右：统计 -->
       <div class="card">
-        <div class="card-title"><span class="icon">📊</span> 实时统计</div>
+        <div class="card-title"><span class="icon">📊</span> Live Statistics</div>
         <div class="grid-3">
           <div class="stat-card">
             <div class="stat-value info" id="statTotal">0</div>
-            <div class="stat-label">总计</div>
+            <div class="stat-label">Total</div>
           </div>
           <div class="stat-card">
             <div class="stat-value success" id="statSuccess">0</div>
-            <div class="stat-label">成功</div>
+            <div class="stat-label">Success</div>
           </div>
           <div class="stat-card">
             <div class="stat-value error" id="statFail">0</div>
-            <div class="stat-label">失败</div>
+            <div class="stat-label">Failed</div>
           </div>
         </div>
         <div class="progress-wrap">
@@ -781,44 +797,44 @@
           <div class="grid-2">
             <div class="stat-card">
               <div class="stat-value warning" id="statPending">0</div>
-              <div class="stat-label">待注册</div>
+              <div class="stat-label">Pending</div>
             </div>
             <div class="stat-card">
               <div class="stat-value" id="statElapsed" style="color:var(--text-primary)">0s</div>
-              <div class="stat-label">耗时</div>
+              <div class="stat-label">Elapsed</div>
             </div>
           </div>
         </div>
         <div style="margin-top:14px; display:flex; align-items:center; gap:8px;">
           <span class="status-dot offline" id="statusDot"></span>
-          <span style="font-size:0.82rem; color:var(--text-secondary)" id="statusText">等待开始</span>
+          <span style="font-size:0.82rem; color:var(--text-secondary)" id="statusText">Idle</span>
         </div>
       </div>
     </div>
 
     <!-- 日志终端 -->
     <div class="card fade-in">
-      <div class="card-title"><span class="icon">🖥️</span> 运行日志</div>
+      <div class="card-title"><span class="icon">🖥️</span> Runtime Log</div>
       <div class="terminal">
         <div class="terminal-header">
           <span class="terminal-dot red"></span>
           <span class="terminal-dot yellow"></span>
           <span class="terminal-dot green"></span>
-          <span class="terminal-title">api_register.py</span>
+          <span class="terminal-title">api-register-go</span>
         </div>
         <div class="terminal-body" id="logOutput">
-          <div class="log-line dim">等待开始注册...</div>
+          <div class="log-line dim">Waiting to start registration...</div>
         </div>
       </div>
     </div>
 
     <!-- 注册结果 -->
     <div class="card fade-in">
-      <div class="card-title"><span class="icon">📋</span> 注册结果</div>
+      <div class="card-title"><span class="icon">📋</span> Registration Results</div>
       <div id="resultsContainer">
         <div class="empty-state">
           <div class="icon">📭</div>
-          <p>暂无注册结果</p>
+          <p>No registration results yet</p>
         </div>
       </div>
     </div>
@@ -835,14 +851,299 @@
     let results = [];
     const LEGACY_REGISTER_PASSWORD = 'Qwer1234!';
     const DEFAULT_REGISTER_PASSWORD = 'Qwer1234!Aa#';
+    let currentLanguage = 'en';
+
+    const UI_TEXT = {
+      en: {
+        documentTitle: 'OpenAI API Registration Console',
+        languageLabel: 'Language',
+        headerTitle: '⚡ OpenAI API Registration',
+        headerSubtitle: 'Pure API batch registration · Browser fingerprint spoofing · IMAP auto verification',
+        configTitle: '⚙️ Registration Settings',
+        modeOutlook: '📮 Outlook Account Mode',
+        modeDomain: '🌐 Custom Domain Mail Mode',
+        modeTemp: '🧪 Temp Mail Mode',
+        outlookPasswordLabel: 'OpenAI Registration Password',
+        outlookPasswordPlaceholder: 'Default OpenAI registration password for Outlook mode',
+        outlookPasswordHint: 'The account list still uses mailbox passwords. To override one line, use column 5: email----mail_password----client_id----refresh_token----openai_password',
+        accountsLabel: 'Account List',
+        accountsPlaceholder: 'One per line: email----mail_password----client_id----refresh_token----OpenAI_password(optional)\nExample:\nuser@outlook.com----mail_password----client_id----refresh_token----Qwer1234!Aa#',
+        accountsHint: 'You can paste from accounts.txt. Column 5 is optional; when omitted, the OpenAI password above will be used.',
+        domainImapTitle: '📮 Domain Mail IMAP Configuration',
+        domainRegisterTitle: '📧 Registration Mail Settings',
+        domainLabels: ['IMAP Server', 'IMAP Port', 'IMAP Username', 'IMAP Password', 'Domain', 'Mailbox Prefix', 'Registration Count', 'OpenAI Password'],
+        domainPasswordPlaceholder: 'Shared password',
+        domainImapPasswordPlaceholder: 'IMAP password / app password',
+        domainHint: 'The system will generate prefix+random@domain mailboxes automatically for batch registration.',
+        cleanupButton: '🧹 Clean OpenAI mail from domain inbox',
+        tempTitle: '🧪 Temp Mail Configuration (tempmail.lol)',
+        tempLabels: ['Registration Count', 'OpenAI Password', 'Delay Before Next Account (seconds)', 'Description', 'Tempmail API Base URL'],
+        tempDescriptionValue: 'Wait after the previous token is acquired, then switch to the next account',
+        tempApiHint: 'Default is tempmail.lol. You can switch to another compatible API endpoint.',
+        tempParallelLabel: '⚡ Enable Temp Mail parallel registration (uses global worker count)',
+        tempHint: 'Default delay is 15 seconds. Set to 0 to switch immediately after a token is acquired. In parallel mode, the delay applies per worker.',
+        proxyLabel: 'Proxy',
+        proxyPlaceholder: 'http://ip:port (optional)',
+        workersLabel: 'Worker Count',
+        buttons: {
+          start: '🚀 Start Registration',
+          stop: '⏹ Stop',
+          retry: '🔁 Retry Failed Accounts',
+          load: '📂 Load File',
+          connecting: '⏳ Connecting...'
+        },
+        skipFinished: '⏭️ Skip accounts that already have saved credentials (existing files in results/tokens)',
+        statsTitle: '📊 Live Statistics',
+        statLabels: ['Total', 'Success', 'Failed', 'Pending', 'Elapsed'],
+        statusIdle: 'Idle',
+        statusRunning: 'Registration in progress...',
+        statusDone: 'Completed',
+        logTitle: '🖥️ Runtime Log',
+        logPlaceholder: 'Waiting to start registration...',
+        resultsTitle: '📋 Registration Results',
+        resultsEmpty: 'No registration results yet',
+        resultsHeaders: ['#', 'Email', 'Status', 'Elapsed', 'Detail'],
+        resultSuccess: '✓ Success',
+        resultFail: '✗ Failed',
+        errors: {
+          fillDomain: '❌ Please enter a domain',
+          fillImap: '❌ Please complete the IMAP configuration',
+          passwordTooShort: '❌ OpenAI password must be at least 12 characters',
+          tempCount: '❌ Temp Mail registration count must be greater than 0',
+          fillAccounts: '❌ Please paste the account list first',
+          connectBackend: '❌ Cannot connect to backend: {message}',
+          startFailed: '❌ Start failed: {message}',
+          stopFailed: '⚠️ Failed to stop: {message}',
+          noOriginalRetry: '❌ Could not find the original lines for the failed accounts',
+          fillDomainImapConfig: '❌ Please fill in the domain IMAP configuration first',
+          cleanupFailed: '❌ Cleanup failed: {message}',
+          connectImap: '❌ Cannot connect to the Go IMAP service: {message}'
+        },
+        toasts: {
+          started: '🚀 Started. Pending accounts: {total}',
+          stopping: '⏹ Stopping...',
+          loadedFile: '📂 Loaded {file}. Accounts: {count}',
+          noFailed: '✅ No failed accounts',
+          retryPrepared: '🔁 Loaded {count} failed accounts and starting retry...',
+          cleanupStarted: '🧹 Cleanup task started',
+          cleanupDeleted: '🧹 Deleted {count} OpenAI emails',
+          finished: '✅ Done. Success: {success}, Failed: {fail}'
+        },
+        logs: {
+          taskStarted: '🚀 Registration task started...',
+          pendingSummary: '📧 Pending: {total}, Workers: {workers}',
+          retryPrepared: '🔁 Retrying {count} failed accounts',
+          loadedFile: '📂 Loaded: {file} ({count} accounts)',
+          doneSummary: '✅ Completed. Success: {success}, Failed: {fail}',
+          doneElapsed: '⏱️ Total elapsed: {elapsed}',
+          cleanupStarting: '🧹 Cleaning OpenAI mail...',
+          cleanupDeleted: '🧹 Cleanup completed. Deleted {count} emails'
+        }
+      },
+      'zh-TW': {
+        documentTitle: 'OpenAI 協議註冊控制台',
+        languageLabel: '語言',
+        headerTitle: '⚡ OpenAI 協議註冊',
+        headerSubtitle: '純 API 批量註冊 · 瀏覽器指紋偽裝 · IMAP 自動驗證',
+        configTitle: '⚙️ 註冊設定',
+        modeOutlook: '📮 Outlook 帳號模式',
+        modeDomain: '🌐 網域郵箱模式',
+        modeTemp: '🧪 Temp Mail 模式',
+        outlookPasswordLabel: 'OpenAI 註冊密碼',
+        outlookPasswordPlaceholder: 'Outlook 模式使用的預設 OpenAI 註冊密碼',
+        outlookPasswordHint: '帳號列表仍填郵箱密碼。若某一行要單獨覆蓋，可用第 5 欄：郵箱----郵箱密碼----client_id----refresh_token----OpenAI密碼',
+        accountsLabel: '帳號列表',
+        accountsPlaceholder: '每行一個：郵箱----郵箱密碼----client_id----refresh_token----OpenAI密碼(可選)\n例如：\nuser@outlook.com----mail_password----client_id----refresh_token----Qwer1234!Aa#',
+        accountsHint: '支援直接貼上 accounts.txt。第 5 欄可省略；不填時會使用上方的 OpenAI 註冊密碼。',
+        domainImapTitle: '📮 網域郵箱 IMAP 設定',
+        domainRegisterTitle: '📧 註冊郵箱設定',
+        domainLabels: ['IMAP 伺服器', 'IMAP 埠', 'IMAP 帳號', 'IMAP 密碼', '網域', '郵箱前綴', '註冊數量', 'OpenAI 密碼'],
+        domainPasswordPlaceholder: '統一密碼',
+        domainImapPasswordPlaceholder: 'IMAP 密碼 / 應用程式密碼',
+        domainHint: '系統會自動生成 前綴+亂數@網域 的郵箱地址進行批量註冊。',
+        cleanupButton: '🧹 清理網域郵箱中的 OpenAI 郵件',
+        tempTitle: '🧪 Temp Mail 設定（tempmail.lol）',
+        tempLabels: ['註冊數量', 'OpenAI 密碼', '切換下一個前延遲（秒）', '說明', 'Tempmail API Base URL'],
+        tempDescriptionValue: '拿到前一個 Token 後等待再切到下一個',
+        tempApiHint: '預設使用 tempmail.lol，也可以切成相容的 API 位址。',
+        tempParallelLabel: '⚡ 啟用 Temp Mail 平行註冊（使用全域工作執行緒數）',
+        tempHint: '預設延遲 15 秒。設為 0 代表成功拿到 Token 後立即切換。平行模式下，這個延遲會對每個工作執行緒分別生效。',
+        proxyLabel: '代理',
+        proxyPlaceholder: 'http://ip:port（可選）',
+        workersLabel: '並發執行緒數',
+        buttons: {
+          start: '🚀 開始註冊',
+          stop: '⏹ 停止',
+          retry: '🔁 重試失敗帳號',
+          load: '📂 載入檔案',
+          connecting: '⏳ 連線中...'
+        },
+        skipFinished: '⏭️ 跳過已有憑證的帳號（results/tokens 已有結果檔）',
+        statsTitle: '📊 即時統計',
+        statLabels: ['總計', '成功', '失敗', '待註冊', '耗時'],
+        statusIdle: '等待開始',
+        statusRunning: '註冊進行中...',
+        statusDone: '已完成',
+        logTitle: '🖥️ 執行日誌',
+        logPlaceholder: '等待開始註冊...',
+        resultsTitle: '📋 註冊結果',
+        resultsEmpty: '暫無註冊結果',
+        resultsHeaders: ['#', '郵箱', '狀態', '耗時', '詳情'],
+        resultSuccess: '✓ 成功',
+        resultFail: '✗ 失敗',
+        errors: {
+          fillDomain: '❌ 請填寫網域',
+          fillImap: '❌ 請完整填寫 IMAP 設定',
+          passwordTooShort: '❌ OpenAI 密碼至少需要 12 位',
+          tempCount: '❌ Temp Mail 註冊數量必須大於 0',
+          fillAccounts: '❌ 請先貼上帳號列表',
+          connectBackend: '❌ 無法連接後端：{message}',
+          startFailed: '❌ 啟動失敗：{message}',
+          stopFailed: '⚠️ 停止失敗：{message}',
+          noOriginalRetry: '❌ 找不到失敗帳號的原始內容',
+          fillDomainImapConfig: '❌ 請先填寫網域郵箱 IMAP 設定',
+          cleanupFailed: '❌ 清理失敗：{message}',
+          connectImap: '❌ 無法連接 Go IMAP 服務：{message}'
+        },
+        toasts: {
+          started: '🚀 已啟動！待註冊 {total} 個',
+          stopping: '⏹ 正在停止...',
+          loadedFile: '📂 已載入 {file}，共 {count} 個帳號',
+          noFailed: '✅ 沒有失敗的帳號',
+          retryPrepared: '🔁 已填入 {count} 個失敗帳號，開始重試...',
+          cleanupStarted: '🧹 清理任務已啟動',
+          cleanupDeleted: '🧹 已刪除 {count} 封 OpenAI 郵件',
+          finished: '✅ 完成！成功 {success} 個，失敗 {fail} 個'
+        },
+        logs: {
+          taskStarted: '🚀 註冊任務已啟動...',
+          pendingSummary: '📧 待註冊：{total} 個，並發：{workers}',
+          retryPrepared: '🔁 重試 {count} 個失敗帳號',
+          loadedFile: '📂 已載入：{file}（{count} 個帳號）',
+          doneSummary: '✅ 全部完成！成功：{success}，失敗：{fail}',
+          doneElapsed: '⏱️ 總耗時：{elapsed}',
+          cleanupStarting: '🧹 正在清理 OpenAI 郵件...',
+          cleanupDeleted: '🧹 清理完成：已刪除 {count} 封郵件'
+        }
+      }
+    };
 
     let originalAccountLines = {}
 
       ; // email -> 原始行文本，用于重试
 
+    function t(path, params = {}) {
+      const bundle = UI_TEXT[currentLanguage] || UI_TEXT.en;
+      const fallback = UI_TEXT.en;
+      let value = path.split('.').reduce((acc, key) => acc && acc[key], bundle);
+      if (value === undefined) {
+        value = path.split('.').reduce((acc, key) => acc && acc[key], fallback);
+      }
+      if (typeof value !== 'string') return '';
+      return value.replace(/\{(\w+)\}/g, (_, key) => params[key] ?? '');
+    }
+
+    function uiLocale() {
+      return currentLanguage === 'zh-TW' ? 'zh-Hant-TW' : 'en-US';
+    }
+
+    function setLanguage(lang) {
+      currentLanguage = UI_TEXT[lang] ? lang : 'en';
+      localStorage.setItem('uiLanguage', currentLanguage);
+      document.documentElement.lang = currentLanguage === 'zh-TW' ? 'zh-Hant' : 'en';
+      document.title = t('documentTitle');
+      document.getElementById('languageLabel').textContent = t('languageLabel');
+      document.getElementById('languageSelect').value = currentLanguage;
+
+      document.querySelector('.header h1').textContent = t('headerTitle');
+      document.querySelector('.header p').textContent = t('headerSubtitle');
+      document.querySelectorAll('.card-title')[0].innerHTML = `<span class="icon">⚙️</span> ${t('configTitle').replace(/^⚙️\s*/, '')}`;
+      document.getElementById('btnModeOutlook').textContent = t('modeOutlook');
+      document.getElementById('btnModeDomain').textContent = t('modeDomain');
+      document.getElementById('btnModeTemp').textContent = t('modeTemp');
+
+      const outlookLabels = document.querySelectorAll('#panelOutlook .form-group label');
+      outlookLabels[0].textContent = t('outlookPasswordLabel');
+      outlookLabels[1].textContent = t('accountsLabel');
+      document.getElementById('outlookRegisterPassword').placeholder = t('outlookPasswordPlaceholder');
+      document.getElementById('accounts').placeholder = t('accountsPlaceholder');
+      const outlookHints = document.querySelectorAll('#panelOutlook .hint');
+      outlookHints[0].textContent = t('outlookPasswordHint');
+      outlookHints[1].textContent = t('accountsHint');
+
+      const domainTitles = document.querySelectorAll('#panelDomain > div > div:first-child');
+      domainTitles[0].textContent = t('domainImapTitle');
+      domainTitles[1].textContent = t('domainRegisterTitle');
+      const domainLabels = document.querySelectorAll('#panelDomain .form-group label');
+      UI_TEXT[currentLanguage].domainLabels.forEach((label, idx) => {
+        if (domainLabels[idx]) domainLabels[idx].textContent = label;
+      });
+      document.getElementById('domainImapPass').placeholder = t('domainImapPasswordPlaceholder');
+      document.getElementById('domainPassword').placeholder = t('domainPasswordPlaceholder');
+      document.querySelector('#panelDomain .hint').textContent = t('domainHint');
+      document.querySelector('#panelDomain button').textContent = t('cleanupButton');
+
+      const tempTitle = document.querySelector('#panelTemp > div > div:first-child');
+      tempTitle.textContent = t('tempTitle');
+      const tempLabels = document.querySelectorAll('#panelTemp .form-group label');
+      UI_TEXT[currentLanguage].tempLabels.forEach((label, idx) => {
+        if (tempLabels[idx]) tempLabels[idx].textContent = label;
+      });
+      document.querySelector('#panelTemp input[readonly]').value = t('tempDescriptionValue');
+      const tempHints = document.querySelectorAll('#panelTemp .hint');
+      if (tempHints[0]) tempHints[0].textContent = t('tempApiHint');
+      if (tempHints[1]) tempHints[1].textContent = t('tempHint');
+      document.querySelector('label[for="tempMailParallel"]').textContent = t('tempParallelLabel');
+
+      document.getElementById('proxy').previousElementSibling.textContent = t('proxyLabel');
+      document.getElementById('proxy').placeholder = t('proxyPlaceholder');
+      document.getElementById('workers').previousElementSibling.textContent = t('workersLabel');
+      document.querySelector('label[for="skipFinished"]').textContent = t('skipFinished');
+
+      document.querySelectorAll('.card-title')[1].innerHTML = `<span class="icon">📊</span> ${t('statsTitle').replace(/^📊\s*/, '')}`;
+      const statLabels = document.querySelectorAll('.stat-label');
+      UI_TEXT[currentLanguage].statLabels.forEach((label, idx) => {
+        if (statLabels[idx]) statLabels[idx].textContent = label;
+      });
+
+      document.querySelectorAll('.card-title')[2].innerHTML = `<span class="icon">🖥️</span> ${t('logTitle').replace(/^🖥️\s*/, '')}`;
+      document.querySelectorAll('.card-title')[3].innerHTML = `<span class="icon">📋</span> ${t('resultsTitle').replace(/^📋\s*/, '')}`;
+
+      document.getElementById('btnRetry').textContent = t('buttons.retry');
+      document.getElementById('btnLoadFile').textContent = t('buttons.load');
+
+      if (results.length === 0) {
+        document.getElementById('resultsContainer').innerHTML = `<div class="empty-state"><div class="icon">📭</div><p>${t('resultsEmpty')}</p></div>`;
+      }
+      refreshLogPlaceholder();
+      renderResults();
+      updateUI();
+    }
+
+    function refreshLogPlaceholder() {
+      const el = document.getElementById('logOutput');
+      const currentText = (el.textContent || '').trim();
+      if (
+        el.dataset.placeholderActive === 'true' ||
+        el.children.length === 0 ||
+        currentText === 'Waiting to start registration...' ||
+        currentText === '等待開始註冊...' ||
+        currentText === '等待开始注册...'
+      ) {
+        el.innerHTML = `<div class="log-line dim">${t('logPlaceholder')}</div>`;
+        el.dataset.placeholderActive = 'true';
+      }
+    }
+
     function normalizeRegisterPassword(value) {
       const raw = (value || '').trim();
       if (!raw || raw === LEGACY_REGISTER_PASSWORD) return DEFAULT_REGISTER_PASSWORD;
+      return raw;
+    }
+
+    function normalizeOutlookRegisterPassword(value) {
+      const raw = (value || '').trim();
+      if (!raw || raw === LEGACY_REGISTER_PASSWORD || raw.length < 12) return DEFAULT_REGISTER_PASSWORD;
       return raw;
     }
 
@@ -914,12 +1215,20 @@
       localStorage.setItem('domainConfig', JSON.stringify(cfg));
     }
 
+    function saveOutlookConfig() {
+      const cfg = {
+        register_password: normalizeOutlookRegisterPassword(document.getElementById('outlookRegisterPassword').value),
+      };
+      localStorage.setItem('outlookConfig', JSON.stringify(cfg));
+    }
+
     function saveTempMailConfig() {
       const cfg = {
         count: document.getElementById('tempMailCount').value,
         password: normalizeRegisterPassword(document.getElementById('tempMailPassword').value),
         next_delay_seconds: document.getElementById('tempMailNextDelay').value,
         allow_parallel: document.getElementById('tempMailParallel').checked,
+        api_base_url: document.getElementById('tempMailApiBaseURL').value.trim(),
       };
       localStorage.setItem('tempMailConfig', JSON.stringify(cfg));
     }
@@ -928,6 +1237,7 @@
       const cfg = {
         proxy: document.getElementById('proxy').value,
         workers: document.getElementById('workers').value,
+        language: currentLanguage,
       };
       localStorage.setItem('runtimeConfig', JSON.stringify(cfg));
     }
@@ -935,6 +1245,15 @@
     function loadDomainConfig() {
       const mode = localStorage.getItem('mailMode') || 'outlook';
       setMailMode(mode);
+
+      try {
+        const outlookCfg = JSON.parse(localStorage.getItem('outlookConfig') || '{}');
+        if (outlookCfg.register_password) {
+          document.getElementById('outlookRegisterPassword').value = normalizeOutlookRegisterPassword(outlookCfg.register_password);
+        }
+      }
+
+      catch (e) { }
 
       try {
         const cfg = JSON.parse(localStorage.getItem('domainConfig') || '{}');
@@ -960,6 +1279,9 @@
         if (typeof tempCfg.allow_parallel === 'boolean') {
           document.getElementById('tempMailParallel').checked = tempCfg.allow_parallel;
         }
+        if (tempCfg.api_base_url) {
+          document.getElementById('tempMailApiBaseURL').value = tempCfg.api_base_url;
+        }
       }
 
       catch (e) { }
@@ -968,6 +1290,7 @@
         const runtimeCfg = JSON.parse(localStorage.getItem('runtimeConfig') || '{}');
         if (runtimeCfg.proxy !== undefined) document.getElementById('proxy').value = runtimeCfg.proxy;
         if (runtimeCfg.workers) document.getElementById('workers').value = runtimeCfg.workers;
+        currentLanguage = runtimeCfg.language || localStorage.getItem('uiLanguage') || 'en';
       }
 
       catch (e) { }
@@ -975,6 +1298,10 @@
       const tempParallelEl = document.getElementById('tempMailParallel');
       if (tempParallelEl) {
         tempParallelEl.addEventListener('change', saveTempMailConfig);
+      }
+      const tempApiBaseEl = document.getElementById('tempMailApiBaseURL');
+      if (tempApiBaseEl) {
+        tempApiBaseEl.addEventListener('change', saveTempMailConfig);
       }
       const tempDelayEl = document.getElementById('tempMailNextDelay');
       if (tempDelayEl) {
@@ -984,10 +1311,23 @@
       if (proxyEl) {
         proxyEl.addEventListener('change', saveRuntimeConfig);
       }
+      const outlookPasswordEl = document.getElementById('outlookRegisterPassword');
+      if (outlookPasswordEl) {
+        outlookPasswordEl.addEventListener('change', saveOutlookConfig);
+      }
       const workersEl = document.getElementById('workers');
       if (workersEl) {
         workersEl.addEventListener('change', saveRuntimeConfig);
       }
+      const languageEl = document.getElementById('languageSelect');
+      if (languageEl) {
+        languageEl.value = currentLanguage;
+        languageEl.addEventListener('change', (e) => {
+          setLanguage(e.target.value);
+          saveRuntimeConfig();
+        });
+      }
+      setLanguage(currentLanguage || 'en');
     }
 
     // 页面加载时恢复配置
@@ -1001,6 +1341,7 @@
       const proxy = document.getElementById('proxy').value.trim();
       const configuredWorkers = Math.max(1, parseInt(document.getElementById('workers').value) || 1);
       let workers = configuredWorkers;
+      let outlookRegisterPassword = '';
       let domainMailPayload = null;
       let tempMailPayload = null;
       saveRuntimeConfig();
@@ -1017,17 +1358,17 @@
         const imapPass = document.getElementById('domainImapPass').value;
 
         if (!domain) {
-          showToast('❌ 请填写域名', 'error');
+          showToast(t('errors.fillDomain'), 'error');
           return;
         }
 
         if (!imapHost || !imapUser || !imapPass) {
-          showToast('❌ 请完整填写 IMAP 配置', 'error');
+          showToast(t('errors.fillImap'), 'error');
           return;
         }
 
         if (password.length < 12) {
-          showToast('❌ OpenAI 密码至少需要 12 位', 'error');
+          showToast(t('errors.passwordTooShort'), 'error');
           return;
         }
 
@@ -1062,14 +1403,15 @@
         const password = normalizeRegisterPassword(document.getElementById('tempMailPassword').value);
         const nextDelaySeconds = Math.max(0, parseInt(document.getElementById('tempMailNextDelay').value) || 0);
         const allowParallel = document.getElementById('tempMailParallel').checked;
+        const apiBaseURL = document.getElementById('tempMailApiBaseURL').value.trim();
 
         if (count < 1) {
-          showToast('❌ Temp Mail 注册数量必须大于 0', 'error');
+          showToast(t('errors.tempCount'), 'error');
           return;
         }
 
         if (password.length < 12) {
-          showToast('❌ OpenAI 密码至少需要 12 位', 'error');
+          showToast(t('errors.passwordTooShort'), 'error');
           return;
         }
 
@@ -1082,18 +1424,23 @@
           lines.push(`temp-mail-${i + 1}@placeholder.local----${password}`);
         }
         accountsText = lines.join('\n');
-        tempMailPayload = { count, password, next_delay_seconds: nextDelaySeconds, allow_parallel: allowParallel };
+        tempMailPayload = { count, password, next_delay_seconds: nextDelaySeconds, allow_parallel: allowParallel, api_base_url: apiBaseURL };
       }
 
       else {
         // Outlook 模式：从账号列表
+        saveOutlookConfig();
         accountsText = document.getElementById('accounts').value.trim();
+        outlookRegisterPassword = normalizeOutlookRegisterPassword(document.getElementById('outlookRegisterPassword').value);
 
         if (!accountsText) {
-          showToast('❌ 请先填入账号列表', 'error');
-          appendLog('❌ 请先填入账号列表', 'error');
+          showToast(t('errors.fillAccounts'), 'error');
+          appendLog(t('errors.fillAccounts'), 'error');
           return;
         }
+
+        tempMailPayload = null;
+        domainMailPayload = null;
       }
 
       // 保存原始账号行，用于后续重试
@@ -1107,17 +1454,19 @@
       // 显示加载状态
       const btn = document.getElementById('btnStart');
       btn.disabled = true;
-      btn.textContent = '⏳ 连接中...';
+      btn.textContent = t('buttons.connecting');
       document.getElementById('btnRetry').style.display = 'none';
 
       try {
         const payload = {
           accounts: accountsText, proxy, workers,
-          login_mode: document.getElementById('loginMode').checked,
+          language: currentLanguage,
+          login_mode: true,
           skip_finished: document.getElementById('skipFinished').checked
         }
 
           ;
+        if (currentMailMode === 'outlook') payload.outlook_register_password = outlookRegisterPassword;
         if (domainMailPayload) payload.domain_mail = domainMailPayload;
         if (tempMailPayload) payload.temp_mail = tempMailPayload;
 
@@ -1138,7 +1487,7 @@
           appendLog(`❌ ${data.error}`, 'error');
 
           btn.disabled = false;
-          btn.textContent = '🚀 开始注册';
+          btn.textContent = t('buttons.start');
           return;
         }
 
@@ -1149,11 +1498,11 @@
         connectSSE();
         startTimer();
 
-        showToast(`🚀 已启动！待注册 ${data.total} 个`, 'success');
+        showToast(t('toasts.started', { total: data.total }), 'success');
 
-        appendLog('🚀 注册任务已启动...', 'info');
+        appendLog(t('logs.taskStarted'), 'info');
 
-        appendLog(`📧 待注册: ${data.total} 个, 并发: ${workers}`, 'info');
+        appendLog(t('logs.pendingSummary', { total: data.total, workers }), 'info');
 
 
         document.getElementById('statTotal').textContent = data.total;
@@ -1165,13 +1514,13 @@
       }
 
       catch (e) {
-        showToast(`❌ 无法连接后端: ${e.message}`, 'error');
+        showToast(t('errors.connectBackend', { message: e.message }), 'error');
 
 
-        appendLog(`❌ 启动失败: ${e.message}`, 'error');
+        appendLog(t('errors.startFailed', { message: e.message }), 'error');
 
         btn.disabled = false;
-        btn.textContent = '🚀 开始注册';
+        btn.textContent = t('buttons.start');
       }
     }
 
@@ -1180,12 +1529,12 @@
         await fetch('/api/stop', {
           method: 'POST'
         });
-        showToast('⏹ 正在停止...', 'warning');
-        appendLog('⏹ 正在停止...', 'warning');
+        showToast(t('toasts.stopping'), 'warning');
+        appendLog(t('toasts.stopping'), 'warning');
       }
 
       catch (e) {
-        appendLog(`⚠️ 停止失败: ${e.message}`, 'warning');
+        appendLog(t('errors.stopFailed', { message: e.message }), 'warning');
 
       }
     }
@@ -1204,8 +1553,8 @@
           document.getElementById('accounts').value = ev.target.result;
           const lineCount = ev.target.result.trim().split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).length;
 
-          showToast(`📂 已载入 ${file.name}，共 ${lineCount} 个账号`, 'success');
-          appendLog(`📂 已载入: ${file.name} (${lineCount} 个账号)`, 'info');
+          showToast(t('toasts.loadedFile', { file: file.name, count: lineCount }), 'success');
+          appendLog(t('logs.loadedFile', { file: file.name, count: lineCount }), 'info');
         };
 
         reader.readAsText(file);
@@ -1220,7 +1569,7 @@
       const failedEmails = results.filter(r => !r.success).map(r => r.email);
 
       if (failedEmails.length === 0) {
-        showToast('✅ 没有失败的账号', 'success');
+        showToast(t('toasts.noFailed'), 'success');
         return;
       }
 
@@ -1242,17 +1591,17 @@
       }
 
       if (retryLines.length === 0) {
-        showToast('❌ 无法找到失败账号的原始信息', 'error');
+        showToast(t('errors.noOriginalRetry'), 'error');
         return;
       }
 
       // 填入失败账号并自动开始
       document.getElementById('accounts').value = retryLines.join('\n');
 
-      showToast(`🔁 已填入 ${retryLines.length} 个失败账号，开始重试...`, 'info');
+      showToast(t('toasts.retryPrepared', { count: retryLines.length }), 'info');
 
 
-      appendLog(`🔁 重试 ${retryLines.length} 个失败账号`, 'warning');
+      appendLog(t('logs.retryPrepared', { count: retryLines.length }), 'warning');
 
       startRegister();
     }
@@ -1309,13 +1658,14 @@
       const el = document.getElementById('logOutput');
 
       // 清除默认提示
-      if (el.children.length === 1 && el.firstChild.textContent === '等待开始注册...') {
+      if (el.dataset.placeholderActive === 'true') {
         el.innerHTML = '';
+        el.dataset.placeholderActive = 'false';
       }
 
       const line = document.createElement('div');
       line.className = `log-line ${level}`;
-      const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      const time = new Date().toLocaleTimeString(uiLocale(), { hour12: false });
       line.textContent = `[${time}] ${text}`;
 
       el.appendChild(line);
@@ -1351,12 +1701,12 @@
       stopTimer();
 
       appendLog(`\n${'═'.repeat(40)}`, 'dim');
-      appendLog(`✅ 全部完成！成功: ${data.success}, 失败: ${data.fail}`, 'success');
-      appendLog(`⏱️ 总耗时: ${data.elapsed}`, 'info');
+      appendLog(t('logs.doneSummary', { success: data.success, fail: data.fail }), 'success');
+      appendLog(t('logs.doneElapsed', { elapsed: data.elapsed }), 'info');
       appendLog(`${'═'.repeat(40)}`, 'dim');
 
 
-      showToast(`✅ 完成！成功 ${data.success} 个，失败 ${data.fail} 个`, data.fail > 0 ? 'warning' : 'success');
+      showToast(t('toasts.finished', { success: data.success, fail: data.fail }), data.fail > 0 ? 'warning' : 'success');
 
       // 有失败时显示重试按钮
       const failCount = results.filter(r => !r.success).length;
@@ -1367,15 +1717,16 @@
       const container = document.getElementById('resultsContainer');
 
       if (results.length === 0) {
-        container.innerHTML = `<div class="empty-state"><div class="icon">📭</div><p>暂无注册结果</p></div>`;
+        container.innerHTML = `<div class="empty-state"><div class="icon">📭</div><p>${t('resultsEmpty')}</p></div>`;
         return;
       }
 
-      let html = `<table class="results-table"><thead><tr><th>#</th><th>邮箱</th><th>状态</th><th>耗时</th><th>详情</th></tr></thead><tbody>`;
+      const headers = UI_TEXT[currentLanguage].resultsHeaders;
+      let html = `<table class="results-table"><thead><tr><th>${headers[0]}</th><th>${headers[1]}</th><th>${headers[2]}</th><th>${headers[3]}</th><th>${headers[4]}</th></tr></thead><tbody>`;
 
       results.forEach((r, i) => {
-        const badge = r.success ? '<span class="badge badge-success">✓ 成功</span>'
-          : '<span class="badge badge-error">✗ 失败</span>';
+        const badge = r.success ? `<span class="badge badge-success">${t('resultSuccess')}</span>`
+          : `<span class="badge badge-error">${t('resultFail')}</span>`;
         const detail = r.success ? (r.account_id || '—') : (r.error || '—');
 
         html += `<tr><td>${i + 1}</td><td style="font-family:'JetBrains Mono',monospace;font-size:0.8rem">${r.email || '—'}</td><td>${badge}</td><td>${r.elapsed || '—'}</td><td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-secondary);font-size:0.78rem">${detail}</td></tr>`;
@@ -1397,19 +1748,20 @@
       if (isRunning) {
         btnStart.style.display = 'none';
         btnStart.disabled = false;
-        btnStart.textContent = '🚀 开始注册';
+        btnStart.textContent = t('buttons.start');
         btnStop.style.display = 'inline-flex';
+        btnStop.textContent = t('buttons.stop');
         dot.className = 'status-dot online pulse';
-        text.textContent = '注册进行中...';
+        text.textContent = t('statusRunning');
       }
 
       else {
         btnStart.style.display = 'inline-flex';
         btnStart.disabled = false;
-        btnStart.textContent = '🚀 开始注册';
+        btnStart.textContent = t('buttons.start');
         btnStop.style.display = 'none';
         dot.className = 'status-dot offline';
-        text.textContent = results.length > 0 ? '已完成' : '等待开始';
+        text.textContent = results.length > 0 ? t('statusDone') : t('statusIdle');
         // 不隐藏 btnRetry，由 onDone 控制
       }
     }
@@ -1486,8 +1838,8 @@
               ;
 
             if (d && d.deleted !== undefined) {
-              appendLog('🧹 清理完成: 已删除 ' + d.deleted + ' 封邮件', 'success');
-              showToast('🧹 已删除 ' + d.deleted + ' 封 OpenAI 邮件', 'success');
+              appendLog(t('logs.cleanupDeleted', { count: d.deleted }), 'success');
+              showToast(t('toasts.cleanupDeleted', { count: d.deleted }), 'success');
             }
           }
         }
@@ -1559,7 +1911,7 @@
 
         if (!cfg.host || !cfg.username || !cfg.password) {
 
-          showToast('❌ 请先填写域名邮箱 IMAP 配置', 'error');
+          showToast(t('errors.fillDomainImapConfig'), 'error');
           return;
         }
 
@@ -1574,7 +1926,7 @@
           ,
           body: JSON.stringify(cfg),
         });
-        appendLog('🧹 正在清理 OpenAI 邮件...', 'info');
+        appendLog(t('logs.cleanupStarting'), 'info');
 
         const resp = await fetch(GO_IMAP_URL + '/api/cleanup', {
           method: 'POST'
@@ -1582,16 +1934,16 @@
         const data = await resp.json();
 
         if (data.ok) {
-          showToast('🧹 清理任务已启动', 'success');
+          showToast(t('toasts.cleanupStarted'), 'success');
         }
 
         else {
-          appendLog('❌ 清理失败: ' + (data.error || ''), 'error');
+          appendLog(t('errors.cleanupFailed', { message: data.error || '' }), 'error');
         }
       }
 
       catch (e) {
-        appendLog('❌ 无法连接 Go IMAP 服务: ' + e.message, 'error');
+        appendLog(t('errors.connectImap', { message: e.message }), 'error');
       }
     }
 

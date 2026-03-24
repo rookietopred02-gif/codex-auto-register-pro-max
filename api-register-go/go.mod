@@ -9,6 +9,7 @@ require (
 	github.com/bogdanfinn/tls-client v1.7.10
 	github.com/emersion/go-imap v1.2.1
 	github.com/emersion/go-message v0.18.2
+	go.etcd.io/bbolt v1.4.3
 )
 
 require (

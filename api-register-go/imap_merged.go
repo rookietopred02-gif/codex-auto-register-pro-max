@@ -585,8 +585,9 @@ func (s *IntegratedIMAPService) fetchLatestCodesOnce() error {
 
 	changed := false
 	mailboxEmail := strings.ToLower(strings.TrimSpace(s.getConfig().Username))
+	pendingEmails := s.PendingWaiterEmails()
 	for msg := range messages {
-		code, entry, ok := parseIntegratedMessage(msg, section, mailboxEmail)
+		code, entry, ok := parseIntegratedMessage(msg, section, mailboxEmail, pendingEmails)
 		if !ok || code == "" || entry.Email == "" {
 			continue
 		}
@@ -604,7 +605,7 @@ func (s *IntegratedIMAPService) fetchLatestCodesOnce() error {
 	return nil
 }
 
-func parseIntegratedMessage(msg *imap.Message, section *imap.BodySectionName, mailboxEmail string) (string, IntegratedIMAPCode, bool) {
+func parseIntegratedMessage(msg *imap.Message, section *imap.BodySectionName, mailboxEmail string, pendingEmails []string) (string, IntegratedIMAPCode, bool) {
 	body := msg.GetBody(section)
 	if body == nil {
 		return "", IntegratedIMAPCode{}, false
@@ -675,6 +676,9 @@ func parseIntegratedMessage(msg *imap.Message, section *imap.BodySectionName, ma
 		cc,
 		to,
 	)
+	if targetEmail == "" {
+		targetEmail = pickIntegratedPendingEmail(mailboxEmail, pendingEmails)
+	}
 	if targetEmail == "" {
 		return "", IntegratedIMAPCode{}, false
 	}
@@ -753,10 +757,26 @@ func pickIntegratedTargetEmail(mailboxEmail, content, from string, headers ...st
 	if alias := extractIntegratedAnonAddyAlias(from, mailboxEmail); alias != "" {
 		return alias
 	}
-	if len(candidates) > 0 {
-		return candidates[0]
-	}
 	return ""
+}
+
+func pickIntegratedPendingEmail(mailboxEmail string, pendingEmails []string) string {
+	if len(pendingEmails) != 1 {
+		return ""
+	}
+	email := strings.ToLower(strings.TrimSpace(pendingEmails[0]))
+	if email == "" {
+		return ""
+	}
+	if shouldSkipIntegratedTargetEmail(email) {
+		return ""
+	}
+	// Allow the mailbox address itself when the direct inbox address is the only
+	// account currently waiting for an OTP.
+	if mailboxEmail != "" && email == strings.ToLower(strings.TrimSpace(mailboxEmail)) {
+		return email
+	}
+	return email
 }
 
 func collectIntegratedTargetEmails(headers ...string) []string {

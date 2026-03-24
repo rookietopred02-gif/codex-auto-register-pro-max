@@ -2,3 +2,4 @@
 tokens/
 _tmp_*.html
 _tmp_*.js
+temp_mail_state.db

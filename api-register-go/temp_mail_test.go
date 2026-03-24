@@ -115,6 +115,28 @@ func TestFindBestTempMailCodeMarksNonCandidateSeen(t *testing.T) {
 	}
 }
 
+func TestFindBestTempMailCodeStrictMinTimeSkipsOlderOTP(t *testing.T) {
+	seen := map[string]struct{}{}
+	minTime := time.Date(2026, 3, 24, 21, 45, 19, 0, time.UTC)
+
+	rows := []tempMailRow{
+		{
+			ID:       "otp-old",
+			Received: "2026-03-24T21:45:03Z",
+			Text:     `{"mail_subject":"Your ChatGPT code is 508698","mail_from":"noreply@tm.openai.com"}`,
+		},
+		{
+			ID:       "otp-new",
+			Received: "2026-03-24T21:45:21Z",
+			Text:     `{"mail_subject":"Your ChatGPT code is 113294","mail_from":"noreply@tm.openai.com"}`,
+		},
+	}
+
+	if got := findBestTempMailCode(rows, minTime, seen); got != "113294" {
+		t.Fatalf("expected newest OTP after minTime, got %q", got)
+	}
+}
+
 func TestIsTempMailCodeCandidate(t *testing.T) {
 	if !isTempMailCodeCandidate("ChatGPT security code") {
 		t.Fatal("expected ChatGPT text to be candidate")
@@ -127,6 +149,7 @@ func TestIsTempMailCodeCandidate(t *testing.T) {
 func TestTempMailConfigureResetsTaskFlags(t *testing.T) {
 	delay0 := 0
 	svc := &TempMailService{
+		provider:     "tempmail-lol",
 		firstServed:  true,
 		freshOnFirst: true,
 		createGap:    30 * time.Second,
@@ -140,7 +163,54 @@ func TestTempMailConfigureResetsTaskFlags(t *testing.T) {
 	if svc.freshOnFirst {
 		t.Fatalf("expected freshOnFirst to reset for new task")
 	}
+	if svc.provider != "" {
+		t.Fatalf("expected provider to reset for new task, got %q", svc.provider)
+	}
 	if svc.createGap != 0 {
 		t.Fatalf("expected createGap to follow config, got %s", svc.createGap)
+	}
+}
+
+func TestMarkRejectedMailboxBlocksDomainAndClearsActiveMailbox(t *testing.T) {
+	svc := &TempMailService{
+		provider:       "tempmail-lol",
+		token:          "tok",
+		currentMailbox: "user@sharebot.net",
+		blockedDomains: map[string]string{},
+	}
+
+	got := svc.MarkRejectedMailbox("user@sharebot.net", "create account rejected")
+	if got != "sharebot.net" {
+		t.Fatalf("got %q want sharebot.net", got)
+	}
+	if !svc.isBlockedDomainLocked("sharebot.net") {
+		t.Fatal("expected sharebot.net to be blocked")
+	}
+	if svc.currentMailbox != "" {
+		t.Fatalf("expected current mailbox cleared, got %q", svc.currentMailbox)
+	}
+	if svc.token != "" {
+		t.Fatalf("expected tempmail.lol token cleared, got %q", svc.token)
+	}
+}
+
+func TestDecodeTempmailLOLInbox(t *testing.T) {
+	body := `{"address":"demo@tempmail.lol","token":"tok-1","emails":[{"date":"2026-03-24T10:00:00Z","from":"noreply@tm.openai.com","subject":"Your ChatGPT code is 654321","body":"654321"}]}`
+
+	mailbox, rows, err := decodeTempmailLOLInbox(body, "")
+	if err != nil {
+		t.Fatalf("decodeTempmailLOLInbox() unexpected error: %v", err)
+	}
+	if mailbox != "demo@tempmail.lol" {
+		t.Fatalf("mailbox = %q, want demo@tempmail.lol", mailbox)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("len(rows) = %d, want 1", len(rows))
+	}
+	if rows[0].Received != "2026-03-24T10:00:00Z" {
+		t.Fatalf("rows[0].Received = %q", rows[0].Received)
+	}
+	if extractTempMailCode(rows[0].Text, len(rows)) != "654321" {
+		t.Fatalf("expected parsed code 654321, got %q", extractTempMailCode(rows[0].Text, len(rows)))
 	}
 }

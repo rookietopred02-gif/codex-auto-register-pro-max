@@ -74,15 +74,15 @@ func TestPickIntegratedTargetEmailPrefersAliasOverMailbox(t *testing.T) {
 	}
 }
 
-func TestPickIntegratedTargetEmailFallsBackToMailboxForDirectInbox(t *testing.T) {
+func TestPickIntegratedTargetEmailReturnsEmptyWithoutAliasEvidence(t *testing.T) {
 	got := pickIntegratedTargetEmail(
 		"gifulin.tw@gmail.com",
 		"",
 		"",
 		"gifulin.tw@gmail.com",
 	)
-	if got != "gifulin.tw@gmail.com" {
-		t.Fatalf("unexpected direct inbox target: %q", got)
+	if got != "" {
+		t.Fatalf("unexpected target without alias evidence: %q", got)
 	}
 }
 
@@ -95,6 +95,36 @@ func TestPickIntegratedTargetEmailExtractsAnonAddyAliasFromFromHeader(t *testing
 	)
 	if got != "openaixbieit945@gifulin.anonaddy.com" {
 		t.Fatalf("unexpected alias from AnonAddy sender: %q", got)
+	}
+}
+
+func TestPickIntegratedPendingEmailUsesSingleAliasWaiter(t *testing.T) {
+	got := pickIntegratedPendingEmail(
+		"gifulin.tw@gmail.com",
+		[]string{"auto1774207319@gifulin.anonaddy.com"},
+	)
+	if got != "auto1774207319@gifulin.anonaddy.com" {
+		t.Fatalf("unexpected pending alias target: %q", got)
+	}
+}
+
+func TestPickIntegratedPendingEmailAllowsSingleMailboxWaiter(t *testing.T) {
+	got := pickIntegratedPendingEmail(
+		"gifulin.tw@gmail.com",
+		[]string{"gifulin.tw@gmail.com"},
+	)
+	if got != "gifulin.tw@gmail.com" {
+		t.Fatalf("unexpected pending mailbox target: %q", got)
+	}
+}
+
+func TestPickIntegratedPendingEmailRejectsAmbiguousWaiters(t *testing.T) {
+	got := pickIntegratedPendingEmail(
+		"gifulin.tw@gmail.com",
+		[]string{"a@example.com", "b@example.com"},
+	)
+	if got != "" {
+		t.Fatalf("unexpected ambiguous pending target: %q", got)
 	}
 }
 
