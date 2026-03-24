@@ -1,0 +1,4 @@
+playwright
+playwright-stealth
+imap_tools
+httpx

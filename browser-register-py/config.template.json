@@ -1,0 +1,15 @@
+{
+    "domain": "example.com",
+    "imap_host": "imap.example.com",
+    "imap_port": 993,
+    "imap_user": "your_email@example.com",
+    "imap_pass": "your_app_password",
+    "email_prefix": "auto",
+    "run_count": 0,
+    "run_interval": 0,
+    "token_dir": "./tokens",
+    "headless": false,
+    "log_enabled": false,
+    "log_dir": "./logs",
+    "proxy": ""
+}
