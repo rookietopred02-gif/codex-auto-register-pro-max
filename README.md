@@ -9,7 +9,6 @@
 
 ## 当前维护说明
 
-- 当前 Git 根目录就是本项目根目录，不再只有 `api-register-go/` 单独作为仓库。
 - `api-register-go/` 当前默认采用 `create_account -> login -> password -> OTP -> token/workspace` 的后置重登链路。
 - 也就是说，只有在 `create_account` 成功后，才会自动切入重新登录流程获取最终 `workspace/token`，不再依赖额外的 Dashboard 开关。
 
