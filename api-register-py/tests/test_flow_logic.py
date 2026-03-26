@@ -200,3 +200,45 @@ class RegisterAccountSequenceTests(unittest.TestCase):
 
         self.assertEqual(first_screen_hint, "signup")
         self.assertEqual(relogin_screen_hint, "login")
+
+    def test_new_account_relogin_retries_without_recreating_account(self):
+        class ReloginRetrySession(FakeSession):
+            role_sequence = ["main", "relogin_fail", "relogin_success"]
+
+            def __init__(self, proxy: str = ""):
+                super().__init__(proxy)
+                self.role = self.role_sequence[self.instance_id - 1]
+
+            def post_json(self, url: str, data: dict, headers=None):
+                if self.role == "relogin_fail" and url.endswith("/authorize/continue"):
+                    self.calls.append(("POST_JSON", url, data))
+                    return APIResponse(403, "<!DOCTYPE html><title>Just a moment...</title>", {})
+                return super().post_json(url, data, headers=headers)
+
+        created_sessions = []
+
+        def session_factory(proxy: str = ""):
+            session = ReloginRetrySession(proxy)
+            created_sessions.append(session)
+            return session
+
+        account = MailAccount(email="user@example.com", password="Secret123!")
+        with patch("api_register.create_api_session", side_effect=session_factory), \
+             patch("api_register.create_oauth_params", return_value={
+                 "auth_url": "https://auth.openai.com/oauth/authorize?state=state-123",
+                 "state": "state-123",
+                 "verifier": "verifier-123",
+             }), \
+             patch("api_register.poll_verification_code", side_effect=["111111", "222222"]), \
+             patch("api_register.random.uniform", return_value=0):
+            result = register_account(account, mode="login")
+
+        self.assertEqual(result["access_token"], "access-token")
+        self.assertEqual(len(created_sessions), 3)
+
+        create_calls = [
+            1
+            for method, url, _ in created_sessions[0].calls
+            if method == "POST_JSON" and url.endswith("/create_account")
+        ]
+        self.assertEqual(len(create_calls), 1)

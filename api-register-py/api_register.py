@@ -1345,6 +1345,79 @@ def complete_workspace_token_exchange(
     return token_resp.json()
 
 
+def complete_post_create_relogin(
+    proxy: str,
+    email_addr: str,
+    password: str,
+    codes: set,
+    cancel_fn: Optional[Callable],
+    domain_mail: Optional[dict],
+    sleep_fn: Callable[[float, float], None],
+    max_attempts: int = 2,
+) -> dict:
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with create_api_session(proxy) as relogin_http:
+                relogin_oauth, relogin_sentinel = start_oauth_flow(relogin_http, "登录")
+                sleep_fn(0.5, 1.5)
+
+                login_start_data, login_page_type = submit_auth_start(
+                    relogin_http,
+                    email_addr,
+                    relogin_sentinel,
+                    "login",
+                )
+                log.info(f"      页面类型: {login_page_type}")
+                fetch_continue_page(relogin_http, login_start_data, "访问重新登录密码页")
+                if login_page_type != "login_password":
+                    raise RuntimeError(f"重新登录未进入密码页面: {login_page_type}")
+
+                log.info("  [8.1] 提交重新登录密码...")
+                login_data, login_page_type = submit_login_password(relogin_http, password)
+                log.info(f"      下一页面: {login_page_type}")
+                fetch_continue_page(relogin_http, login_data, "访问重新登录验证码页")
+                if login_page_type != "email_otp_verification":
+                    raise RuntimeError(f"重新登录未进入验证码页面: {login_page_type}")
+
+                relogin_otp_sent_at = time.time()
+
+                def _relogin_resend():
+                    r = relogin_http.post_json(
+                        OAI_EMAIL_OTP_RESEND_URL,
+                        {},
+                        headers={"Referer": "https://auth.openai.com/email-verification"},
+                    )
+                    return r.ok()
+
+                relogin_code = poll_verification_code(
+                    MailAccount(email=email_addr, password=password),
+                    used_codes=codes,
+                    resend_fn=_relogin_resend,
+                    otp_sent_at=relogin_otp_sent_at,
+                    cancel_fn=cancel_fn,
+                    domain_mail=domain_mail,
+                )
+                validate_email_otp(
+                    relogin_http,
+                    relogin_code,
+                    label="重新登录 OTP",
+                    step_label="  [8.2]",
+                )
+                return complete_workspace_token_exchange(relogin_http, relogin_oauth)
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            log.warning(f"  [8] 重新登录失败，重试 #{attempt + 1}: {exc}")
+            sleep_fn(0.8, 1.4)
+
+    raise RuntimeError(f"重新登录失败: {last_error}")
+
+
 def register_account(
     mail_account: MailAccount,
     proxy: str = "",
@@ -1467,53 +1540,15 @@ def register_account(
         should_relogin = should_relogin_after_create_account(is_existing_account, is_login)
         if should_relogin:
             log.info("  [8] 新账号已创建，重启登录流程以获取 workspace/token...")
-            with create_api_session(proxy) as relogin_http:
-                relogin_oauth, relogin_sentinel = start_oauth_flow(relogin_http, mode_label)
-                _sleep(0.5, 1.5)
-
-                login_start_data, login_page_type = submit_auth_start(
-                    relogin_http,
-                    email_addr,
-                    relogin_sentinel,
-                    "login",
-                )
-                log.info(f"      页面类型: {login_page_type}")
-                fetch_continue_page(relogin_http, login_start_data, "访问重新登录密码页")
-                if login_page_type != "login_password":
-                    raise RuntimeError(f"重新登录未进入密码页面: {login_page_type}")
-
-                log.info("  [8.1] 提交重新登录密码...")
-                login_data, login_page_type = submit_login_password(relogin_http, mail_account.password)
-                log.info(f"      下一页面: {login_page_type}")
-                fetch_continue_page(relogin_http, login_data, "访问重新登录验证码页")
-                if login_page_type != "email_otp_verification":
-                    raise RuntimeError(f"重新登录未进入验证码页面: {login_page_type}")
-
-                relogin_otp_sent_at = time.time()
-
-                def _relogin_resend():
-                    r = relogin_http.post_json(
-                        OAI_EMAIL_OTP_RESEND_URL,
-                        {},
-                        headers={"Referer": "https://auth.openai.com/email-verification"},
-                    )
-                    return r.ok()
-
-                relogin_code = poll_verification_code(
-                    mail_account,
-                    used_codes=codes,
-                    resend_fn=_relogin_resend,
-                    otp_sent_at=relogin_otp_sent_at,
-                    cancel_fn=cancel_fn,
-                    domain_mail=domain_mail,
-                )
-                validate_email_otp(
-                    relogin_http,
-                    relogin_code,
-                    label="重新登录 OTP",
-                    step_label="  [8.2]",
-                )
-                token_data = complete_workspace_token_exchange(relogin_http, relogin_oauth)
+            token_data = complete_post_create_relogin(
+                proxy=proxy,
+                email_addr=email_addr,
+                password=mail_account.password,
+                codes=codes,
+                cancel_fn=cancel_fn,
+                domain_mail=domain_mail,
+                sleep_fn=_sleep,
+            )
         else:
             token_data = complete_workspace_token_exchange(http, oauth, create_account_data)
 
