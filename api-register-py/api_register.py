@@ -537,10 +537,13 @@ class DomainMailHub:
                 self._ref_count = 0
 
     def wait_code(self, email: str, timeout: int, used_codes: set,
-                  otp_sent_at: float, cancel_fn=None, resend_fn=None) -> str:
+                  otp_sent_at: float, cancel_fn=None, resend_fn=None,
+                  allow_clock_skew: bool = True) -> str:
         """阻塞等待验证码，直到收到或超时"""
         email_lower = email.lower()
-        min_ts = (otp_sent_at - 60) if otp_sent_at else 0
+        min_ts = 0
+        if otp_sent_at:
+            min_ts = (otp_sent_at - 60) if allow_clock_skew else otp_sent_at
         start = time.time()
         last_resend = 0.0
 
@@ -551,6 +554,8 @@ class DomainMailHub:
             # 检查是否有分发的验证码
             with self._lock:
                 queue = self._waiters.get(email_lower, [])
+                if queue:
+                    queue.sort(key=lambda item: (item[2] or 0), reverse=True)
                 while queue:
                     code, source, mail_ts = queue.pop(0)
                     if code in used_codes:
@@ -768,6 +773,7 @@ def poll_verification_code(
     otp_sent_at: Optional[float] = None,
     cancel_fn: Optional[Callable] = None,
     domain_mail: Optional[dict] = None,
+    allow_clock_skew: bool = True,
 ) -> str:
     """轮询邮箱获取 OpenAI 6 位验证码
     
@@ -796,6 +802,7 @@ def poll_verification_code(
                 otp_sent_at=otp_sent_at or 0,
                 cancel_fn=cancel_fn,
                 resend_fn=resend_fn,
+                allow_clock_skew=allow_clock_skew,
             )
         finally:
             hub.unregister(account.email)
@@ -804,7 +811,9 @@ def poll_verification_code(
     start = time.time()
     email_lower = account.email.lower()
     # 如果有 otp_sent_at，只接受该时间 60 秒前之后的邮件（留出时钟偏差）
-    min_ts = (otp_sent_at - 60) if otp_sent_at else 0
+    min_ts = 0
+    if otp_sent_at:
+        min_ts = (otp_sent_at - 60) if allow_clock_skew else otp_sent_at
     intervals = [3, 4, 5, 6, 8, 10]
     idx = 0
     last_resend = 0.0
@@ -1293,6 +1302,33 @@ def validate_email_otp(
     log.info("      OK")
 
 
+def _is_wrong_code_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "wrong code" in message or "验证码错误" in message
+
+
+def validate_email_otp_with_recheck(
+    http: APISession,
+    code: str,
+    repoll_fn: Optional[Callable[[], str]] = None,
+    label: str = "OTP",
+    step_label: str = "  [6]",
+) -> str:
+    try:
+        validate_email_otp(http, code, label=label, step_label=step_label)
+        return code
+    except RuntimeError as exc:
+        if repoll_fn is None or not _is_wrong_code_error(exc):
+            raise
+
+        log.warning(f"{step_label} 验证失败，立即回查邮箱获取更新验证码: {exc}")
+        new_code = repoll_fn()
+        if not new_code or new_code == code:
+            raise
+        validate_email_otp(http, new_code, label=label, step_label=step_label)
+        return new_code
+
+
 def complete_workspace_token_exchange(
     http: APISession,
     oauth: dict,
@@ -1349,7 +1385,7 @@ def complete_post_create_relogin(
     proxy: str,
     email_addr: str,
     password: str,
-    codes: set,
+    relogin_codes: set,
     cancel_fn: Optional[Callable],
     domain_mail: Optional[dict],
     sleep_fn: Callable[[float, float], None],
@@ -1393,15 +1429,26 @@ def complete_post_create_relogin(
 
                 relogin_code = poll_verification_code(
                     MailAccount(email=email_addr, password=password),
-                    used_codes=codes,
+                    used_codes=relogin_codes,
                     resend_fn=_relogin_resend,
                     otp_sent_at=relogin_otp_sent_at,
                     cancel_fn=cancel_fn,
                     domain_mail=domain_mail,
+                    allow_clock_skew=False,
                 )
-                validate_email_otp(
+                validate_email_otp_with_recheck(
                     relogin_http,
                     relogin_code,
+                    repoll_fn=lambda: poll_verification_code(
+                        MailAccount(email=email_addr, password=password),
+                        timeout=min(12, IMAP_POLL_TIMEOUT),
+                        used_codes=relogin_codes,
+                        resend_fn=_relogin_resend,
+                        otp_sent_at=relogin_otp_sent_at,
+                        cancel_fn=cancel_fn,
+                        domain_mail=domain_mail,
+                        allow_clock_skew=False,
+                    ),
                     label="重新登录 OTP",
                     step_label="  [8.2]",
                 )
@@ -1432,7 +1479,8 @@ def register_account(
     返回包含 token 信息的字典。
     """
     email_addr = mail_account.email
-    codes = used_codes or set()
+    initial_stage_codes = set()
+    relogin_stage_codes = set()
     is_login = (mode == "login")
     mode_label = "登录" if is_login else "注册"
 
@@ -1501,7 +1549,7 @@ def register_account(
             return r.ok()
 
         code = poll_verification_code(
-            mail_account, used_codes=codes,
+            mail_account, used_codes=initial_stage_codes,
             resend_fn=_resend,
             otp_sent_at=otp_sent_at,
             cancel_fn=cancel_fn,
@@ -1513,7 +1561,19 @@ def register_account(
 
         # --- 6. 验证 OTP ---
         _check_cancel()
-        validate_email_otp(http, code)
+        validate_email_otp_with_recheck(
+            http,
+            code,
+            repoll_fn=lambda: poll_verification_code(
+                mail_account,
+                timeout=min(12, IMAP_POLL_TIMEOUT),
+                used_codes=initial_stage_codes,
+                resend_fn=_resend,
+                otp_sent_at=otp_sent_at,
+                cancel_fn=cancel_fn,
+                domain_mail=domain_mail,
+            ),
+        )
 
         _sleep(0.5, 1.5)
 
@@ -1544,7 +1604,7 @@ def register_account(
                 proxy=proxy,
                 email_addr=email_addr,
                 password=mail_account.password,
-                codes=codes,
+                relogin_codes=relogin_stage_codes,
                 cancel_fn=cancel_fn,
                 domain_mail=domain_mail,
                 sleep_fn=_sleep,

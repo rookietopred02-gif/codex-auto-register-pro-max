@@ -6,6 +6,7 @@ import json
 
 from api_register import (
     APIResponse,
+    DomainMailHub,
     MailAccount,
     choose_initial_screen_hint,
     choose_post_email_action,
@@ -62,6 +63,46 @@ class FlowLogicTests(unittest.TestCase):
     def test_workspace_resolution_reports_malformed_cookie(self):
         with self.assertRaisesRegex(RuntimeError, "解析 cookie"):
             resolve_workspace_id("bad-cookie")
+
+    def test_domain_mail_hub_prefers_newer_code_for_same_email(self):
+        hub = DomainMailHub({"host": "imap.gmail.com", "port": 993, "user": "u", "pass": "p"})
+        email = "fresh@example.com"
+        used_codes = set()
+        hub.register(email)
+        try:
+            with hub._lock:
+                hub._waiters[email] = [
+                    ("111111", "subject", 100.0),
+                    ("222222", "subject", 104.0),
+                ]
+                hub._delivered[email] = {"111111", "222222"}
+            code = hub.wait_code(email, timeout=1, used_codes=used_codes, otp_sent_at=90.0)
+            self.assertEqual(code, "222222")
+        finally:
+            hub.unregister(email)
+
+    def test_domain_mail_hub_strict_mode_skips_pre_otp_codes(self):
+        hub = DomainMailHub({"host": "imap.gmail.com", "port": 993, "user": "u", "pass": "p"})
+        email = "fresh@example.com"
+        used_codes = set()
+        hub.register(email)
+        try:
+            with hub._lock:
+                hub._waiters[email] = [
+                    ("111111", "subject", 100.0),
+                    ("222222", "subject", 161.0),
+                ]
+                hub._delivered[email] = {"111111", "222222"}
+            code = hub.wait_code(
+                email,
+                timeout=1,
+                used_codes=used_codes,
+                otp_sent_at=160.0,
+                allow_clock_skew=False,
+            )
+            self.assertEqual(code, "222222")
+        finally:
+            hub.unregister(email)
 
 
 class FakeSession:
@@ -242,3 +283,69 @@ class RegisterAccountSequenceTests(unittest.TestCase):
             if method == "POST_JSON" and url.endswith("/create_account")
         ]
         self.assertEqual(len(create_calls), 1)
+
+    def test_relogin_can_reuse_same_numeric_code_as_signup_stage(self):
+        account = MailAccount(email="user@example.com", password="Secret123!")
+        poll_calls = {"count": 0}
+
+        def fake_poll(account_arg, **kwargs):
+            used_codes = kwargs["used_codes"]
+            if poll_calls["count"] == 0:
+                poll_calls["count"] += 1
+                used_codes.add("111111")
+                return "111111"
+            self.assertNotIn("111111", used_codes)
+            poll_calls["count"] += 1
+            used_codes.add("111111")
+            return "111111"
+
+        with patch("api_register.APISession", FakeSession), \
+             patch("api_register.create_oauth_params", return_value={
+                 "auth_url": "https://auth.openai.com/oauth/authorize?state=state-123",
+                 "state": "state-123",
+                 "verifier": "verifier-123",
+             }), \
+             patch("api_register.poll_verification_code", side_effect=fake_poll), \
+             patch("api_register.random.uniform", return_value=0):
+            result = register_account(account, mode="login")
+
+        self.assertEqual(result["access_token"], "access-token")
+        self.assertEqual(poll_calls["count"], 2)
+
+    def test_wrong_code_triggers_immediate_recheck_for_newer_email_code(self):
+        class WrongCodeRetrySession(FakeSession):
+            def __init__(self, proxy: str = ""):
+                super().__init__(proxy)
+                self._otp_validate_calls = 0
+
+            def post_json(self, url: str, data: dict, headers=None):
+                if url.endswith("/email-otp/validate"):
+                    self.calls.append(("POST_JSON", url, data))
+                    self._otp_validate_calls += 1
+                    if self._otp_validate_calls == 1:
+                        return APIResponse(
+                            401,
+                            json.dumps({
+                                "error": {
+                                    "message": "Wrong code. Please check it and try again.",
+                                    "type": "invalid_request_error",
+                                }
+                            }),
+                            {},
+                        )
+                    return APIResponse(200, json.dumps({"ok": True}), {})
+                return super().post_json(url, data, headers=headers)
+
+        account = MailAccount(email="user@example.com", password="Secret123!")
+        with patch("api_register.APISession", WrongCodeRetrySession), \
+             patch("api_register.create_oauth_params", return_value={
+                 "auth_url": "https://auth.openai.com/oauth/authorize?state=state-123",
+                 "state": "state-123",
+                 "verifier": "verifier-123",
+             }), \
+             patch("api_register.poll_verification_code", side_effect=["111111", "222222", "333333"]), \
+             patch("api_register.should_relogin_after_create_account", return_value=False), \
+             patch("api_register.random.uniform", return_value=0):
+            result = register_account(account, mode="login")
+
+        self.assertEqual(result["access_token"], "access-token")
