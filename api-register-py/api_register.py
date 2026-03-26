@@ -49,6 +49,10 @@ OAI_TOKEN_URL = "https://auth.openai.com/oauth/token"
 OAI_SENTINEL_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
 OAI_SIGNUP_URL = "https://auth.openai.com/api/accounts/authorize/continue"
 OAI_SEND_OTP_URL = "https://auth.openai.com/api/accounts/passwordless/send-otp"
+OAI_USER_REGISTER_URL = "https://auth.openai.com/api/accounts/user/register"
+OAI_PASSWORD_VERIFY_URL = "https://auth.openai.com/api/accounts/password/verify"
+OAI_EMAIL_OTP_SEND_URL = "https://auth.openai.com/api/accounts/email-otp/send"
+OAI_EMAIL_OTP_RESEND_URL = "https://auth.openai.com/api/accounts/email-otp/resend"
 OAI_VERIFY_OTP_URL = "https://auth.openai.com/api/accounts/email-otp/validate"
 OAI_CREATE_URL = "https://auth.openai.com/api/accounts/create_account"
 OAI_WORKSPACE_URL = "https://auth.openai.com/api/accounts/workspace/select"
@@ -533,10 +537,13 @@ class DomainMailHub:
                 self._ref_count = 0
 
     def wait_code(self, email: str, timeout: int, used_codes: set,
-                  otp_sent_at: float, cancel_fn=None, resend_fn=None) -> str:
+                  otp_sent_at: float, cancel_fn=None, resend_fn=None,
+                  allow_clock_skew: bool = True) -> str:
         """阻塞等待验证码，直到收到或超时"""
         email_lower = email.lower()
-        min_ts = (otp_sent_at - 60) if otp_sent_at else 0
+        min_ts = 0
+        if otp_sent_at:
+            min_ts = (otp_sent_at - 60) if allow_clock_skew else otp_sent_at
         start = time.time()
         last_resend = 0.0
 
@@ -547,6 +554,8 @@ class DomainMailHub:
             # 检查是否有分发的验证码
             with self._lock:
                 queue = self._waiters.get(email_lower, [])
+                if queue:
+                    queue.sort(key=lambda item: (item[2] or 0), reverse=True)
                 while queue:
                     code, source, mail_ts = queue.pop(0)
                     if code in used_codes:
@@ -764,6 +773,7 @@ def poll_verification_code(
     otp_sent_at: Optional[float] = None,
     cancel_fn: Optional[Callable] = None,
     domain_mail: Optional[dict] = None,
+    allow_clock_skew: bool = True,
 ) -> str:
     """轮询邮箱获取 OpenAI 6 位验证码
     
@@ -792,6 +802,7 @@ def poll_verification_code(
                 otp_sent_at=otp_sent_at or 0,
                 cancel_fn=cancel_fn,
                 resend_fn=resend_fn,
+                allow_clock_skew=allow_clock_skew,
             )
         finally:
             hub.unregister(account.email)
@@ -800,7 +811,9 @@ def poll_verification_code(
     start = time.time()
     email_lower = account.email.lower()
     # 如果有 otp_sent_at，只接受该时间 60 秒前之后的邮件（留出时钟偏差）
-    min_ts = (otp_sent_at - 60) if otp_sent_at else 0
+    min_ts = 0
+    if otp_sent_at:
+        min_ts = (otp_sent_at - 60) if allow_clock_skew else otp_sent_at
     intervals = [3, 4, 5, 6, 8, 10]
     idx = 0
     last_resend = 0.0
@@ -1061,6 +1074,397 @@ class APIResponse:
 # ═══════════════════════════════════════════════════════
 # 核心注册/登录流程
 # ═══════════════════════════════════════════════════════
+def choose_initial_screen_hint(mode: str) -> str:
+    # The supported dashboard contract always enters the auth flow through
+    # the signup start page first. Only the post-create relogin path should
+    # explicitly switch to the login screen hint.
+    return "signup"
+
+
+def extract_page_type(data: Optional[dict]) -> str:
+    if not isinstance(data, dict):
+        return ""
+    page = data.get("page")
+    if not isinstance(page, dict):
+        return ""
+    page_type = page.get("type", "")
+    return page_type.strip() if isinstance(page_type, str) else ""
+
+
+def extract_continue_url(data: Optional[dict]) -> str:
+    if not isinstance(data, dict):
+        return ""
+    continue_url = data.get("continue_url", "")
+    return continue_url.strip() if isinstance(continue_url, str) else ""
+
+
+def choose_post_email_action(page_type: str, is_login: bool) -> str:
+    if page_type == "create_account_password":
+        return "register_password"
+    if page_type == "email_otp_verification":
+        return "await_otp"
+    if page_type == "login_password" and is_login:
+        return "login_password"
+    return ""
+
+
+def should_relogin_after_create_account(is_existing: bool, is_login: bool) -> bool:
+    return (not is_existing) and is_login
+
+
+def decode_workspace_cookie_data(auth_cookie: str) -> dict:
+    auth_cookie = auth_cookie.strip()
+    if not auth_cookie:
+        raise RuntimeError("未获取到 oai-client-auth-session cookie")
+
+    parts = auth_cookie.split(".")
+    if not parts or not parts[0].strip():
+        raise RuntimeError("oai-client-auth-session cookie 格式异常")
+
+    cookie_b64 = parts[0]
+    padding = "=" * ((4 - len(cookie_b64) % 4) % 4)
+    try:
+        cookie_raw = base64.urlsafe_b64decode(cookie_b64 + padding)
+    except Exception as exc:
+        raise RuntimeError(f"解析 cookie 失败: {exc}") from exc
+
+    try:
+        return json.loads(cookie_raw)
+    except Exception as exc:
+        raise RuntimeError(f"解析 cookie JSON 失败: {exc}") from exc
+
+
+def extract_workspace_id(data: Optional[dict]) -> str:
+    if not isinstance(data, dict):
+        return ""
+
+    for key in ("workspace_id", "default_workspace_id", "selected_workspace_id"):
+        value = data.get(key, "")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    for key in ("workspace", "default_workspace", "selected_workspace"):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            nested_id = extract_workspace_object_id(nested)
+            if nested_id:
+                return nested_id
+
+    workspaces = data.get("workspaces")
+    if isinstance(workspaces, list):
+        for item in workspaces:
+            if isinstance(item, dict):
+                nested_id = extract_workspace_object_id(item)
+                if nested_id:
+                    return nested_id
+
+    for outer_key in ("session", "user", "organization"):
+        nested = data.get(outer_key)
+        if isinstance(nested, dict):
+            nested_id = extract_workspace_id(nested)
+            if nested_id:
+                return nested_id
+
+    return ""
+
+
+def extract_workspace_object_id(data: Optional[dict]) -> str:
+    if not isinstance(data, dict):
+        return ""
+    value = data.get("id", "")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return extract_workspace_id(data)
+
+
+def resolve_workspace_id(auth_cookie: str, *sources: dict) -> tuple[str, Optional[dict]]:
+    for source in sources:
+        workspace_id = extract_workspace_id(source)
+        if workspace_id:
+            return workspace_id, None
+
+    cookie_data = decode_workspace_cookie_data(auth_cookie)
+    return extract_workspace_id(cookie_data), cookie_data
+
+
+def create_api_session(proxy: str = "") -> APISession:
+    return APISession(proxy)
+
+
+def fetch_continue_page(http: APISession, data: Optional[dict], step_label: str) -> None:
+    continue_url = extract_continue_url(data)
+    if not continue_url:
+        return
+    resp = http.get(continue_url)
+    if not resp.ok():
+        raise RuntimeError(f"{step_label}失败: {resp.status} {resp.text[:300]}")
+
+
+def submit_auth_start(http: APISession, email_addr: str, sentinel_header: str, screen_hint: str) -> tuple[dict, str]:
+    referer = "https://auth.openai.com/log-in" if screen_hint == "login" else "https://auth.openai.com/create-account"
+    response = http.post_json(
+        OAI_SIGNUP_URL,
+        {"username": {"value": email_addr, "kind": "email"}, "screen_hint": screen_hint},
+        headers={
+            "Referer": referer,
+            "openai-sentinel-token": sentinel_header,
+        },
+    )
+    if not response.ok():
+        raise RuntimeError(f"提交邮箱失败: {response.status} {response.text[:300]}")
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    return data, extract_page_type(data)
+
+
+def submit_register_password(http: APISession, email_addr: str, password: str) -> tuple[dict, str]:
+    response = http.post_json(
+        OAI_USER_REGISTER_URL,
+        {"username": email_addr, "password": password},
+        headers={"Referer": "https://auth.openai.com/create-account/password"},
+    )
+    if not response.ok():
+        raise RuntimeError(f"提交注册密码失败: {response.status} {response.text[:300]}")
+    data = response.json()
+    return data, extract_page_type(data)
+
+
+def submit_login_password(http: APISession, password: str) -> tuple[dict, str]:
+    response = http.post_json(
+        OAI_PASSWORD_VERIFY_URL,
+        {"password": password},
+        headers={"Referer": "https://auth.openai.com/ul/password"},
+    )
+    if not response.ok():
+        raise RuntimeError(f"提交登录密码失败: {response.status} {response.text[:300]}")
+    data = response.json()
+    return data, extract_page_type(data)
+
+
+def send_email_otp(http: APISession, referer: str = "https://auth.openai.com/create-account/password") -> None:
+    response = http.post_json(
+        OAI_EMAIL_OTP_SEND_URL,
+        {},
+        headers={"Referer": referer},
+    )
+    if not response.ok():
+        raise RuntimeError(f"发送 OTP 失败: {response.status} {response.text[:300]}")
+
+
+def start_oauth_flow(http: APISession, mode_label: str) -> tuple[dict, str]:
+    oauth = create_oauth_params()
+    log.info(f"  [1] 发起 OAuth ({mode_label})...")
+    resp = http.get(oauth["auth_url"])
+    log.info(f"      状态: {resp.status}")
+
+    device_id = http.get_cookie("oai-did") or ""
+    if device_id:
+        log.info(f"      设备ID: {device_id[:16]}...")
+
+    log.info("  [2] 获取 Sentinel token...")
+    sentinel_body = {"p": "", "id": device_id, "flow": "authorize_continue"}
+    sentinel_resp = http.post_json(
+        OAI_SENTINEL_URL,
+        sentinel_body,
+        headers={
+            "Origin": "https://sentinel.openai.com",
+            "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
+        },
+    )
+    if not sentinel_resp.ok():
+        raise RuntimeError(f"Sentinel 失败: {sentinel_resp.status} {sentinel_resp.text[:200]}")
+    sentinel_token = sentinel_resp.json()["token"]
+    sentinel_header = json.dumps({
+        "p": "", "t": "", "c": sentinel_token,
+        "id": device_id, "flow": "authorize_continue",
+    })
+    log.info("      OK")
+    return oauth, sentinel_header
+
+
+def validate_email_otp(
+    http: APISession,
+    code: str,
+    label: str = "OTP",
+    step_label: str = "  [6]",
+) -> None:
+    log.info(f"{step_label} 验证 {label}: {code}")
+    verify_resp = http.post_json(
+        OAI_VERIFY_OTP_URL,
+        {"code": code},
+        headers={"Referer": "https://auth.openai.com/email-verification"},
+    )
+    if not verify_resp.ok():
+        raise RuntimeError(f"{label} 验证失败: {verify_resp.status} {verify_resp.text[:300]}")
+    log.info("      OK")
+
+
+def _is_wrong_code_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "wrong code" in message or "验证码错误" in message
+
+
+def validate_email_otp_with_recheck(
+    http: APISession,
+    code: str,
+    repoll_fn: Optional[Callable[[], str]] = None,
+    label: str = "OTP",
+    step_label: str = "  [6]",
+) -> str:
+    try:
+        validate_email_otp(http, code, label=label, step_label=step_label)
+        return code
+    except RuntimeError as exc:
+        if repoll_fn is None or not _is_wrong_code_error(exc):
+            raise
+
+        log.warning(f"{step_label} 验证失败，立即回查邮箱获取更新验证码: {exc}")
+        new_code = repoll_fn()
+        if not new_code or new_code == code:
+            raise
+        validate_email_otp(http, new_code, label=label, step_label=step_label)
+        return new_code
+
+
+def complete_workspace_token_exchange(
+    http: APISession,
+    oauth: dict,
+    *workspace_sources: dict,
+) -> dict:
+    workspace_id, _cookie_data = resolve_workspace_id(
+        http.get_cookie("oai-client-auth-session") or "",
+        *workspace_sources,
+    )
+    if not workspace_id:
+        raise RuntimeError("未找到 workspace_id")
+
+    log.info(f"  [8] 选择 Workspace: {workspace_id[:20]}...")
+    select_resp = http.post_json(
+        OAI_WORKSPACE_URL,
+        {"workspace_id": workspace_id},
+        headers={"Referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"},
+    )
+    if not select_resp.ok():
+        raise RuntimeError(f"选择 workspace 失败: {select_resp.status}")
+
+    continue_url = extract_continue_url(select_resp.json())
+    if not continue_url:
+        raise RuntimeError("未获取到 continue_url")
+
+    log.info("  [9] 跟随重定向获取 Token...")
+    callback_url = http.follow_redirects(continue_url)
+    if not callback_url:
+        raise RuntimeError("重定向失败，未获取到回调 URL")
+
+    parsed = urllib.parse.urlparse(callback_url)
+    query = urllib.parse.parse_qs(parsed.query)
+    auth_code = query.get("code", [""])[0]
+    returned_state = query.get("state", [""])[0]
+
+    if not auth_code:
+        raise RuntimeError("回调 URL 缺少 code")
+    if returned_state != oauth["state"]:
+        raise RuntimeError("State 不匹配")
+
+    token_resp = http.post_form(OAI_TOKEN_URL, {
+        "grant_type": "authorization_code",
+        "client_id": OAI_CLIENT_ID,
+        "code": auth_code,
+        "redirect_uri": LOCAL_REDIRECT_URI,
+        "code_verifier": oauth["verifier"],
+    })
+    if not token_resp.ok():
+        raise RuntimeError(f"Token 兑换失败: {token_resp.status} {token_resp.text[:300]}")
+    return token_resp.json()
+
+
+def complete_post_create_relogin(
+    proxy: str,
+    email_addr: str,
+    password: str,
+    relogin_codes: set,
+    cancel_fn: Optional[Callable],
+    domain_mail: Optional[dict],
+    sleep_fn: Callable[[float, float], None],
+    max_attempts: int = 2,
+) -> dict:
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with create_api_session(proxy) as relogin_http:
+                relogin_oauth, relogin_sentinel = start_oauth_flow(relogin_http, "登录")
+                sleep_fn(0.5, 1.5)
+
+                login_start_data, login_page_type = submit_auth_start(
+                    relogin_http,
+                    email_addr,
+                    relogin_sentinel,
+                    "login",
+                )
+                log.info(f"      页面类型: {login_page_type}")
+                fetch_continue_page(relogin_http, login_start_data, "访问重新登录密码页")
+                if login_page_type != "login_password":
+                    raise RuntimeError(f"重新登录未进入密码页面: {login_page_type}")
+
+                log.info("  [8.1] 提交重新登录密码...")
+                login_data, login_page_type = submit_login_password(relogin_http, password)
+                log.info(f"      下一页面: {login_page_type}")
+                fetch_continue_page(relogin_http, login_data, "访问重新登录验证码页")
+                if login_page_type != "email_otp_verification":
+                    raise RuntimeError(f"重新登录未进入验证码页面: {login_page_type}")
+
+                relogin_otp_sent_at = time.time()
+
+                def _relogin_resend():
+                    r = relogin_http.post_json(
+                        OAI_EMAIL_OTP_RESEND_URL,
+                        {},
+                        headers={"Referer": "https://auth.openai.com/email-verification"},
+                    )
+                    return r.ok()
+
+                relogin_code = poll_verification_code(
+                    MailAccount(email=email_addr, password=password),
+                    used_codes=relogin_codes,
+                    resend_fn=_relogin_resend,
+                    otp_sent_at=relogin_otp_sent_at,
+                    cancel_fn=cancel_fn,
+                    domain_mail=domain_mail,
+                    allow_clock_skew=False,
+                )
+                validate_email_otp_with_recheck(
+                    relogin_http,
+                    relogin_code,
+                    repoll_fn=lambda: poll_verification_code(
+                        MailAccount(email=email_addr, password=password),
+                        timeout=min(12, IMAP_POLL_TIMEOUT),
+                        used_codes=relogin_codes,
+                        resend_fn=_relogin_resend,
+                        otp_sent_at=relogin_otp_sent_at,
+                        cancel_fn=cancel_fn,
+                        domain_mail=domain_mail,
+                        allow_clock_skew=False,
+                    ),
+                    label="重新登录 OTP",
+                    step_label="  [8.2]",
+                )
+                return complete_workspace_token_exchange(relogin_http, relogin_oauth)
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            log.warning(f"  [8] 重新登录失败，重试 #{attempt + 1}: {exc}")
+            sleep_fn(0.8, 1.4)
+
+    raise RuntimeError(f"重新登录失败: {last_error}")
+
+
 def register_account(
     mail_account: MailAccount,
     proxy: str = "",
@@ -1075,7 +1479,8 @@ def register_account(
     返回包含 token 信息的字典。
     """
     email_addr = mail_account.email
-    codes = used_codes or set()
+    initial_stage_codes = set()
+    relogin_stage_codes = set()
     is_login = (mode == "login")
     mode_label = "登录" if is_login else "注册"
 
@@ -1090,40 +1495,11 @@ def register_account(
             _check_cancel()
             time.sleep(min(0.3, max(0, end - time.time())))
 
-    with APISession(proxy) as http:
+    with create_api_session(proxy) as http:
         # --- 1. 发起 OAuth 授权 ---
         _check_cancel()
-        oauth = create_oauth_params()
-        log.info(f"  [1] 发起 OAuth ({mode_label})...")
-        resp = http.get(oauth["auth_url"])
-        log.info(f"      状态: {resp.status}")
-
-        device_id = http.get_cookie("oai-did") or ""
-        if device_id:
-            log.info(f"      设备ID: {device_id[:16]}...")
-
+        oauth, sentinel_header = start_oauth_flow(http, mode_label)
         _sleep(0.8, 2.0)
-
-        # --- 2. 获取 Sentinel 反机器人令牌 ---
-        _check_cancel()
-        log.info(f"  [2] 获取 Sentinel token...")
-        sentinel_body = {"p": "", "id": device_id, "flow": "authorize_continue"}
-        sentinel_resp = http.post_json(
-            OAI_SENTINEL_URL, sentinel_body,
-            headers={
-                "Origin": "https://sentinel.openai.com",
-                "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
-            }
-        )
-        if not sentinel_resp.ok():
-            raise RuntimeError(f"Sentinel 失败: {sentinel_resp.status} {sentinel_resp.text[:200]}")
-        sentinel_token = sentinel_resp.json()["token"]
-        sentinel_header = json.dumps({
-            "p": "", "t": "", "c": sentinel_token,
-            "id": device_id, "flow": "authorize_continue",
-        })
-        log.info(f"      OK")
-
         _sleep(0.5, 1.5)
 
         # --- 3. 提交邮箱（始终用 signup 流，登录模式在步骤 7 跳过创建）---
@@ -1131,57 +1507,49 @@ def register_account(
         # 记录时间戳——已注册账号在此步骤后 OTP 就会自动发送
         otp_sent_at = time.time()
         log.info(f"  [3] 提交邮箱: {email_addr} ({mode_label})")
-        signup_resp = http.post_json(
-            OAI_SIGNUP_URL,
-            {"username": {"value": email_addr, "kind": "email"}, "screen_hint": "signup"},
-            headers={
-                "Referer": "https://auth.openai.com/create-account",
-                "openai-sentinel-token": sentinel_header,
-            },
-        )
-        if not signup_resp.ok():
-            raise RuntimeError(f"提交邮箱失败: {signup_resp.status} {signup_resp.text[:300]}")
+        screen_hint = choose_initial_screen_hint(mode)
+        step3_data, page_type = submit_auth_start(http, email_addr, sentinel_header, screen_hint)
         log.info(f"      OK")
-
-        # 解析步骤3响应，判断账号状态
-        try:
-            step3_data = signup_resp.json()
-            page_type = step3_data.get("page", {}).get("type", "")
-        except Exception:
-            step3_data = {}
-            page_type = ""
         log.info(f"      页面类型: {page_type}")
+        fetch_continue_page(http, step3_data, "访问下一认证页")
 
         _sleep(0.5, 1.5)
 
         name = ""
-        # 已注册账号：步骤3返回 email_otp_verification → OTP 已自动发送
-        is_existing_account = (page_type == "email_otp_verification")
+        action = choose_post_email_action(page_type, is_login)
+        is_existing_account = action in {"login_password", "await_otp"}
 
         _check_cancel()
-        if is_existing_account:
-            # 已注册账号：OTP 在步骤3提交邮箱时已自动发送
+        if action == "register_password":
+            log.info("  [4] 提交注册密码...")
+            register_data, page_type = submit_register_password(http, email_addr, mail_account.password)
+            log.info(f"      下一页面: {page_type}")
+            fetch_continue_page(http, register_data, "访问下一注册页")
+
+            otp_sent_at = time.time()
+            log.info("  [4] 发送 OTP...")
+            send_email_otp(http)
+            log.info(f"      OK，验证码已发送到 {email_addr}")
+        elif action == "login_password":
+            log.info("  [4] 提交登录密码...")
+            login_data, page_type = submit_login_password(http, mail_account.password)
+            log.info(f"      下一页面: {page_type}")
+            fetch_continue_page(http, login_data, "访问登录验证码页")
+            otp_sent_at = time.time()
+            log.info("  [4] 跳过发送 OTP（密码验证后服务器发送邮箱验证码）")
+        elif action == "await_otp":
             log.info(f"  [4] 跳过发送 OTP（服务器已自动发送）")
         else:
-            # --- 4. 请求发送 OTP 验证码（新账号需要手动触发）---
-            otp_sent_at = time.time()
-            log.info(f"  [4] 发送 OTP...")
-            otp_resp = http.post_json(
-                OAI_SEND_OTP_URL, {},
-                headers={"Referer": "https://auth.openai.com/create-account/password"},
-            )
-            if not otp_resp.ok():
-                raise RuntimeError(f"发送 OTP 失败: {otp_resp.status} {otp_resp.text[:300]}")
-            log.info(f"      OK，验证码已发送到 {email_addr}")
+            raise RuntimeError(f"当前认证流未进入可处理页面: {page_type}")
 
         # --- 5. 通过 IMAP 获取验证码 ---
         def _resend():
-            r = http.post_json(OAI_SEND_OTP_URL, {},
+            r = http.post_json(OAI_EMAIL_OTP_RESEND_URL, {},
                 headers={"Referer": "https://auth.openai.com/email-verification"})
             return r.ok()
 
         code = poll_verification_code(
-            mail_account, used_codes=codes,
+            mail_account, used_codes=initial_stage_codes,
             resend_fn=_resend,
             otp_sent_at=otp_sent_at,
             cancel_fn=cancel_fn,
@@ -1193,20 +1561,26 @@ def register_account(
 
         # --- 6. 验证 OTP ---
         _check_cancel()
-        log.info(f"  [6] 验证 OTP: {code}")
-        verify_resp = http.post_json(
-            OAI_VERIFY_OTP_URL, {"code": code},
-            headers={"Referer": "https://auth.openai.com/email-verification"},
+        validate_email_otp_with_recheck(
+            http,
+            code,
+            repoll_fn=lambda: poll_verification_code(
+                mail_account,
+                timeout=min(12, IMAP_POLL_TIMEOUT),
+                used_codes=initial_stage_codes,
+                resend_fn=_resend,
+                otp_sent_at=otp_sent_at,
+                cancel_fn=cancel_fn,
+                domain_mail=domain_mail,
+            ),
         )
-        if not verify_resp.ok():
-            raise RuntimeError(f"OTP 验证失败: {verify_resp.status} {verify_resp.text[:300]}")
-        log.info(f"      OK")
 
         _sleep(0.5, 1.5)
 
         # --- 7. 创建账号（仅新注册时，已注册账号跳过）---
         _check_cancel()
-        if is_existing_account or is_login:
+        create_account_data = {}
+        if is_existing_account:
             log.info(f"  [7] 跳过（账号已存在）")
         else:
             name = random_name()
@@ -1219,69 +1593,24 @@ def register_account(
             )
             if not create_resp.ok():
                 raise RuntimeError(f"创建账号失败: {create_resp.status} {create_resp.text[:300]}")
+            create_account_data = create_resp.json()
             log.info(f"      OK")
             _sleep(0.5, 1.5)
 
-        # --- 8. 选择 Workspace ---
-        auth_cookie = http.get_cookie("oai-client-auth-session")
-        if not auth_cookie:
-            raise RuntimeError("未获取到 oai-client-auth-session cookie")
-
-        # 解析 cookie 获取 workspace_id
-        try:
-            cookie_b64 = auth_cookie.split(".")[0]
-            padding = "=" * ((4 - len(cookie_b64) % 4) % 4)
-            cookie_data = json.loads(base64.b64decode(cookie_b64 + padding))
-            workspaces = cookie_data.get("workspaces", [])
-            workspace_id = workspaces[0]["id"] if workspaces else None
-        except Exception as e:
-            raise RuntimeError(f"解析 workspace 失败: {e}")
-
-        if not workspace_id:
-            raise RuntimeError("未找到 workspace_id")
-
-        log.info(f"  [8] 选择 Workspace: {workspace_id[:20]}...")
-        select_resp = http.post_json(
-            OAI_WORKSPACE_URL,
-            {"workspace_id": workspace_id},
-            headers={"Referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"},
-        )
-        if not select_resp.ok():
-            raise RuntimeError(f"选择 workspace 失败: {select_resp.status}")
-
-        continue_url = select_resp.json().get("continue_url")
-        if not continue_url:
-            raise RuntimeError("未获取到 continue_url")
-
-        # --- 9. 跟随重定向，获取回调并兑换 token ---
-        log.info(f"  [9] 跟随重定向获取 Token...")
-        callback_url = http.follow_redirects(continue_url)
-        if not callback_url:
-            raise RuntimeError("重定向失败，未获取到回调 URL")
-
-        # 解析回调 URL 中的 code
-        parsed = urllib.parse.urlparse(callback_url)
-        query = urllib.parse.parse_qs(parsed.query)
-        auth_code = query.get("code", [""])[0]
-        returned_state = query.get("state", [""])[0]
-
-        if not auth_code:
-            raise RuntimeError("回调 URL 缺少 code")
-        if returned_state != oauth["state"]:
-            raise RuntimeError("State 不匹配")
-
-        # 兑换 token
-        token_resp = http.post_form(OAI_TOKEN_URL, {
-            "grant_type": "authorization_code",
-            "client_id": OAI_CLIENT_ID,
-            "code": auth_code,
-            "redirect_uri": LOCAL_REDIRECT_URI,
-            "code_verifier": oauth["verifier"],
-        })
-        if not token_resp.ok():
-            raise RuntimeError(f"Token 兑换失败: {token_resp.status} {token_resp.text[:300]}")
-
-        token_data = token_resp.json()
+        should_relogin = should_relogin_after_create_account(is_existing_account, is_login)
+        if should_relogin:
+            log.info("  [8] 新账号已创建，重启登录流程以获取 workspace/token...")
+            token_data = complete_post_create_relogin(
+                proxy=proxy,
+                email_addr=email_addr,
+                password=mail_account.password,
+                relogin_codes=relogin_stage_codes,
+                cancel_fn=cancel_fn,
+                domain_mail=domain_mail,
+                sleep_fn=_sleep,
+            )
+        else:
+            token_data = complete_workspace_token_exchange(http, oauth, create_account_data)
 
         # 解析 id_token 获取额外信息
         claims = decode_jwt_payload(token_data.get("id_token", ""))
