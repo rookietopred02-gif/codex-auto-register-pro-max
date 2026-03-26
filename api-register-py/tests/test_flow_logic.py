@@ -7,6 +7,7 @@ import json
 from api_register import (
     APIResponse,
     MailAccount,
+    choose_initial_screen_hint,
     choose_post_email_action,
     register_account,
     resolve_workspace_id,
@@ -15,6 +16,9 @@ from api_register import (
 
 
 class FlowLogicTests(unittest.TestCase):
+    def test_dashboard_login_contract_uses_signup_screen_hint_initially(self):
+        self.assertEqual(choose_initial_screen_hint("login"), "signup")
+
     def test_dashboard_login_contract_uses_page_type_for_new_account(self):
         self.assertEqual(
             choose_post_email_action("create_account_password", is_login=True),
@@ -178,3 +182,21 @@ class RegisterAccountSequenceTests(unittest.TestCase):
         self.assertEqual(len(sessions), 2)
         relogin_urls = [url for _, url, _ in sessions[1].calls]
         self.assertIn("https://auth.openai.com/api/accounts/password/verify", relogin_urls)
+
+    def test_dashboard_login_contract_uses_signup_then_login_screen_hints(self):
+        sessions = self._run_register_account("new_account")
+        first_screen_hint = None
+        relogin_screen_hint = None
+
+        for method, url, data in sessions[0].calls:
+            if method == "POST_JSON" and url.endswith("/authorize/continue"):
+                first_screen_hint = data.get("screen_hint")
+                break
+
+        for method, url, data in sessions[1].calls:
+            if method == "POST_JSON" and url.endswith("/authorize/continue"):
+                relogin_screen_hint = data.get("screen_hint")
+                break
+
+        self.assertEqual(first_screen_hint, "signup")
+        self.assertEqual(relogin_screen_hint, "login")

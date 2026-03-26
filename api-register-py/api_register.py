@@ -1066,7 +1066,10 @@ class APIResponse:
 # 核心注册/登录流程
 # ═══════════════════════════════════════════════════════
 def choose_initial_screen_hint(mode: str) -> str:
-    return "login" if mode == "login" else "signup"
+    # The supported dashboard contract always enters the auth flow through
+    # the signup start page first. Only the post-create relogin path should
+    # explicitly switch to the login screen hint.
+    return "signup"
 
 
 def extract_page_type(data: Optional[dict]) -> str:
